@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+virtualenv/
+ENV/
+env/
+
+# Django
+*.log
+db.sqlite3
+staticfiles/
+media/
+
+# Celery
+celerybeat-schedule.db
+
+# Backups
+*.json.backup
+backup/
+*.sql
+
+# IDE
+.vscode/
+.idea/
+
+# Others
+*.db
+data_backup.json
+migration.load
