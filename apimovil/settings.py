@@ -159,15 +159,10 @@ CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'  # Redis también como backen
 #        }
 #    }
 
-# Postgresql
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'db_apimovil',
-        'USER': 'admin',
-        'PASSWORD': 'p0lDhDVc5SKo',
-        'HOST': 'localhost',
-        'PORT': '5432',
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
     }
 }
 
@@ -222,7 +217,7 @@ LOGGING = {
         'file': {
             'level': 'DEBUG',
             'class': 'logging.FileHandler',
-            'filename': '/opt/apimovil/django_debug.log',
+            'filename': os.path.join(BASE_DIR, 'django_debug.log'),
             'formatter': 'verbose',
         },
         'console': {

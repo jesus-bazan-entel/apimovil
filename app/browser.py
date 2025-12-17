@@ -91,7 +91,7 @@ class DigiPhone:
         }
 
         data = {
-            "products": [1488],
+            "products": [1577],
             "contractId": None,
             "removePackagesIds": []
         }
@@ -174,19 +174,23 @@ class DigiPhone:
 
     # Get token
     def login(self):
+        logging.info("[LOGIN] Starting login...")
         url = "https://store-backend.digimobil.es/v1/users/login"
         payload = {}
         headers = {}
         response = requests.request("POST", url, headers=headers, data=payload, proxies=self.proxies[self.position]["proxy"])
+        logging.info(f"[LOGIN] Status: {response.status_code}")
         return json.loads(response.text)
     
     def get_preorder(self):
+        logging.info("[PREORDER] Requesting preorder...")
         url = "https://store-backend.digimobil.es/v1/preorders"
         payload = {}
         headers = {
             'Authorization': f'Bearer {self.proxies[self.position]["token"]}'
         }
         response = requests.request("POST", url, headers=headers, data=payload, proxies=self.proxies[self.position]["proxy"])
+        logging.info(f"[PREORDER] Status: {response.status_code}")
         return json.loads(response.text)
     
     def get_config(self):
@@ -226,7 +230,7 @@ class DigiPhone:
         return result
 
     def get_access(self, token=""):
-        print("[+] Init Get Token...")
+        logging.info("[GET_ACCESS] Init Get Token...")
         if not token:
             data_login = self.login()
             self.proxies[self.position]["token"] = data_login["_result"]["token"]
@@ -237,64 +241,25 @@ class DigiPhone:
             data_preorder = self.get_preorder()
             if not self.check_token_and_refresh(data_preorder):
                 break
-        print(data_preorder)
+        logging.info(f"[GET_ACCESS] Preorder data: {data_preorder}")
         self.proxies[self.position]['preorder'] = data_preorder["_result"]["trackingNumber"]
 
         cont = 0
         while True:
             cart_data = self.update_cart()
-            logging.info(cart_data)
+            logging.info(f"[CART] Update response: {cart_data}")
             if cart_data[0] == 200:
                 self.proxies[self.position]['cart'] = cart_data[1]["items"][0]["itemValidated"]["shoppingCartLineId"]
                 break
             else:
-                logging.info("[-] Error get shoppingCartLineId, Reintentan")
+                logging.warning("[CART] Error getting shoppingCartLineId, Retrying...")
 
             if cont >= 3:
                 break
             cont += 1
-
-        #while True:
-        #    data_config = self.get_config()
-        #    if not self.check_token_and_refresh(data_config):
-        #        break
-        #self.proxies[self.position]['product'] = data_config["_result"]["packages"][0]["idPackage"]
-        #print(f"Product: {str(self.product)} - Preorder: {str(self.preorder)}")
-        #print("[+] Finish get token...")
 
 
 if __name__ == "__main__":
     phone = DigiPhone()
     #token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOm51bGwsImlzcyI6Imh0dHBzOlwvXC9cL2luZGV4LnBocCIsImNpZCI6Imh0dHBzOlwvXC9zdG9yZS1hcGkuZGlnaW1vYmlsLmVzIiwiaWF0IjoxNzE3MjY4NDMxLCJleHAiOjE3MTcyNjkwMzEsInNjb3BlIjoicmVhZCB3cml0ZSIsImRhdGEiOnsiaWQiOm51bGwsImFub24iOnRydWUsImlwIjoiOTguOTguMTcxLjUwIiwic2Vzc2lvbl91aWQiOiIxNzE3MjY4NDMxOTY1MjIwIiwidXMiOjEwMCwiYyI6MX19.fBUWh1fVvq-6AcZSCeqxpz6J0qTOzhBH-a4w6PnZ_68"
     token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOm51bGwsImlzcyI6Imh0dHBzOlwvXC9cL2luZGV4LnBocCIsImNpZCI6Imh0dHBzOlwvXC9zdG9yZS1hcGkuZGlnaW1vYmlsLmVzIiwiaWF0IjoxNzI5NzYzODQ5LCJleHAiOjE3Mjk3NjQ0NDksInNjb3BlIjoicmVhZCB3cml0ZSIsImRhdGEiOnsiaWQiOm51bGwsImFub24iOnRydWUsImlwIjoiMTg1LjQ3LjEzMS41MyIsInNlc3Npb25fdWlkIjoiMTcyOTc2Mzg0OTM5NzA4OCIsInVzIjoxMDAsImMiOjF9fQ.nimDL37T2kx9BUduGIC5JAotYR_fNeiljsP3Vt3obsg",
-    #token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOm51bGwsImlzcyI6Imh0dHBzOlwvXC9cL2luZGV4LnBocCIsImNpZCI6Imh0dHBzOlwvXC9zdG9yZS1hcGkuZGlnaW1vYmlsLmVzIiwiaWF0IjoxNzI5MDI0NDMyLCJleHAiOjE3MjkwMjUwMzIsInNjb3BlIjoicmVhZCB3cml0ZSIsImRhdGEiOnsiaWQiOm51bGwsImFub24iOnRydWUsImlwIjoiMTg1LjQ3LjEzMS41MyIsInNlc3Npb25fdWlkIjoiMTcyOTAyNDQzMjU1MzY3OSIsInVzIjoxMDAsImMiOjF9fQ.gG3g_p8JQ1bTySIX_VPcnV_M2Eyo5XojkCbE64sGf0w"
-    #ip = phone.check_ip()
-    #print(ip["ip"])
-    #phone.get_access(token=token)
-    # Get phone
-    # cont = 0
-    # for i in range(5000):
-    #     _phone_number = random.randint(600000000, 700000000)
-    #     #print("[+] Numero ha consultar: "+str(_phone_number))
-    #     data_phone = phone.get_phone_by_request(phone=_phone_number)
-
-    #     if data_phone["_info"]["status"] in [401, 498]:
-    #         print("[+] Check token...")
-    #         #print(data_phone)
-    #         phone.get_access(phone._token)
-    #         data_phone = phone.get_phone_by_request(phone=_phone_number)
-
-    #     operator = None
-    #     if data_phone["_info"]["status"] == 201:
-    #         operator = data_phone["_result"]["operatorSOAPDesc"] if data_phone["_result"]["operatorSOAPDesc"] != None else "No existe"
-    #     elif data_phone["_info"]["status"] == 400:
-    #         if data_phone["_error"] != []:
-    #             if data_phone["_error"]["message"] == "Number is Digi":
-    #                 operator = "DIGI SPAIN TELECOM, S.L."
-        
-    #     print(f"{i} - Phone: {_phone_number} - Operator: {operator}")
-    #     sleep(1)
-    #     cont += 1
-    #     if cont == 100:
-    #         sleep(120)
-    #         cont = 0
