@@ -1,0 +1,19 @@
+[0;1;31m×[0m gunicorn.service - gunicorn daemon
+     Loaded: loaded (]8;;file://20240807Ri7.vpsnet.es/etc/systemd/system/gunicorn.service/etc/systemd/system/gunicorn.service]8;;; [0;1;32menabled[0m; preset: [0;1;32menabled[0m)
+     Active: [0;1;31mfailed[0m (Result: exit-code) since Sat 2024-08-31 02:24:30 CEST; 5min ago
+   Duration: 3.677s
+TriggeredBy: ○ gunicorn.socket
+    Process: 400 ExecStart=/opt/masterfilter/virtualenv/bin/gunicorn --access-logfile - --workers 5 --timeout 120 --bind unix:/run/gunicorn.sock masterfilter.wsgi:application [0;1;31m(code=exited, status=1/FAILURE)[0m
+   Main PID: 400 (code=exited, status=1/FAILURE)
+        CPU: 2.360s
+
+Aug 31 02:24:29 20240807Ri7.vpsnet.es gunicorn[400]: [2024-08-31 02:24:29 +0200] [400] [ERROR] Worker (pid:426) was sent SIGTERM!
+Aug 31 02:24:29 20240807Ri7.vpsnet.es gunicorn[400]:     time.sleep(0.1)
+Aug 31 02:24:29 20240807Ri7.vpsnet.es gunicorn[400]:   File "/opt/masterfilter/virtualenv/lib/python3.11/site-packages/gunicorn/arbiter.py", line 241, in handle_chld
+Aug 31 02:24:29 20240807Ri7.vpsnet.es gunicorn[400]:     self.reap_workers()
+Aug 31 02:24:29 20240807Ri7.vpsnet.es gunicorn[400]:   File "/opt/masterfilter/virtualenv/lib/python3.11/site-packages/gunicorn/arbiter.py", line 529, in reap_workers
+Aug 31 02:24:29 20240807Ri7.vpsnet.es gunicorn[400]:     raise HaltServer(reason, self.WORKER_BOOT_ERROR)
+Aug 31 02:24:29 20240807Ri7.vpsnet.es gunicorn[400]: gunicorn.errors.HaltServer: <HaltServer 'Worker failed to boot.' 3>
+Aug 31 02:24:30 20240807Ri7.vpsnet.es systemd[1]: [0;1;39m[0;1;31m[0;1;39mgunicorn.service: Main process exited, code=exited, status=1/FAILURE[0m
+Aug 31 02:24:30 20240807Ri7.vpsnet.es systemd[1]: [0;1;38;5;185m[0;1;39m[0;1;38;5;185mgunicorn.service: Failed with result 'exit-code'.[0m
+Aug 31 02:24:30 20240807Ri7.vpsnet.es systemd[1]: gunicorn.service: Consumed 2.360s CPU time.

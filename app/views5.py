@@ -1,0 +1,794 @@
+from django.shortcuts import render
+from rest_framework.response import Response
+from rest_framework.decorators import api_view
+from .browser import *
+from .models import *
+import random
+from time import time
+from django.utils import timezone
+from datetime import timedelta
+from .singleton import singleton
+import logging
+import threading
+import queue
+from django.db.models.signals import post_migrate
+from django.dispatch import receiver
+from django.apps import apps
+#*new worker*#
+import pandas as pd
+import concurrent.futures
+from time import sleep
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.common.keys import Keys  # Importar Keys para presionar Enter
+from selenium.common.exceptions import TimeoutException
+import os
+from django.db import close_old_connections
+
+def borrar_movil_por_lotes(user, batch_size=1000):
+    while True:
+        ids = (
+            Movil.objects
+            .filter(user=user)
+            .values_list('id', flat=True)[:batch_size]
+        )
+
+        ids = list(ids)
+        if not ids:
+            break
+
+        Movil.objects.filter(id__in=ids).delete()
+
+def borrar_usuarios_menos_admin():
+    close_old_connections()
+
+    usuarios = User.objects.all().iterator(chunk_size=10)
+
+    for u in usuarios:
+        # Movil en bloques de 1000
+        borrar_movil_por_lotes(u, batch_size=1000)
+
+        # Los dem�s uno a uno (normalmente pocos)
+        for c in Consecutive.objects.filter(user=u).iterator():
+            c.delete()
+
+        for p in Proxy.objects.filter(user=u).iterator():
+            p.delete()
+
+        for b in BlockIp.objects.filter(user=u).iterator():
+            b.delete()
+
+        # Borrar usuario si no es admin
+        if not u.is_superuser:
+            u.delete()
+
+#threading.Thread(
+#    target=borrar_usuarios_menos_admin,
+#    name="delete-users-thread",
+#    daemon=True
+#).start()
+
+def guardar_movil_json():
+    carpeta = "backup"
+    if not os.path.exists(carpeta):
+        os.makedirs(carpeta)  # Crea la carpeta si no existe
+    
+    contador = 0
+    archivo_actual = os.path.join(carpeta, f"moviles_{contador}.json")
+    tamaño_maximo = 100000  # Define cuántos registros tendrá cada archivo
+    
+    with open(archivo_actual, "w", encoding="utf-8") as f:
+        f.write("[")  # Abrir lista JSON
+        for i, movil in enumerate(Movil.objects.all().iterator()):  
+            # Crear diccionario con los datos del modelo
+            data = {
+                "id": movil.id,
+                "file": movil.file,
+                "number": movil.number,
+                "operator": movil.operator,
+                "user": movil.user.username,
+                "ip": movil.ip,
+                "fecha_hora": timezone.localtime(movil.fecha_hora).isoformat(),
+            }
+            
+            # Escribir en el archivo actual
+            json.dump(data, f, ensure_ascii=False)
+            if (i + 1) % tamaño_maximo == 0:
+                f.write("]")  # Cerrar el archivo JSON
+                f.close()
+                contador += 1
+                archivo_actual = os.path.join(carpeta, f"moviles_{contador}.json")
+                f = open(archivo_actual, "w", encoding="utf-8")
+                f.write("[")  # Iniciar nuevo archivo JSON
+            else:
+                f.write(",\n")  # Separar objetos JSON dentro de la lista
+        
+        f.write("]")  # Cerrar el último archivo
+        f.close()
+
+    return f"Se guardaron los archivos en '{carpeta}/moviles_X.json'"
+
+#threading.Thread(target = guardar_movil_json).start()
+
+#@receiver(post_migrate)
+#def reset_consecutive_active(sender, **kwargs):
+#    # Asegúrate de que este código se ejecute solo para la aplicación correcta
+#    if sender.name == 'app':  # Reemplaza 'app' con el nombre real de tu aplicación
+#        Consecutive = apps.get_model('app', 'Consecutive')
+#        for f in Consecutive.objects.all():
+#            f.active = False
+#            f.save()
+
+for f in Consecutive.objects.all():
+    f.active = False
+    f.save()
+
+# Create your views here.
+
+_logging = logging.basicConfig(filename="logger.log", level=logging.INFO)
+
+
+def check_scraping_in_db(number):
+    # Definimos el umbral de 30 días
+    thirty_days_ago = timezone.now() - timedelta(days=30)
+    # Buscamos el número en la base de datos donde ip='Pending' y fecha_hora < 30 días
+    cont = 0
+    while True:
+        try:
+            result = Movil.objects.filter(
+                number=number,
+                ip='Pending',
+                fecha_hora__gte=thirty_days_ago
+            ).order_by('-fecha_hora').first()
+            break
+        except Exception as e:
+            result = None
+            logging.info(f"Error Check DB: {e}")
+        if cont >= 3:
+            break
+        cont += 1
+    # Buscamos el número en la base de datos
+    #result = Movil.objects.filter(number=number).first()
+    # Retornamos solo el número si existe, o None si no se encuentra
+    return result.operator if result else None
+
+
+QUEUE_USER = {}
+
+#for f in Consecutive.objects.all():
+#    f.active = False
+#    f.save()
+
+# Definimos una función que represente el trabajo que cada hilo realizará
+def worker(q, events, _thread, user, reprocess):
+    digiPhone = DigiPhone(user, reprocess)
+    if digiPhone._len_proxy > 0:
+        # Obtener acceso (cookies) al inicio para tenerlas listas
+        try:
+            logging.info(f"[worker] Thread {_thread} - Obteniendo acceso inicial (cookies)...")
+            digiPhone.get_access("", get_cart=False)
+            logging.info(f"[worker] Thread {_thread} - ✓ Acceso obtenido correctamente")
+        except Exception as e_init:
+            logging.warning(f"[worker] Thread {_thread} - ⚠ Error obteniendo acceso inicial: {e_init} (se intentará obtener en cada tarea)")
+        
+        cont = 0
+        while True:
+            # Obtenemos una tarea de la cola
+            task = q.get()
+            if task is None:
+                # Si la tarea es None, salimos del bucle
+                break
+            
+            task_start_time = time()
+            logging.info(f"[worker] Thread {_thread} - Iniciando tarea: {task['phone']} | Usuario: {task['user'].username} | Archivo: {task['data']['file']}")
+
+            acum = 0
+            ssl_error_count = 0  # Contador de errores SSL consecutivos
+            max_task_time = 180  # Timeout máximo por tarea: 3 minutos
+            max_ssl_errors = 3  # Cambiar proxy después de 3 errores SSL consecutivos
+            
+            while True:
+                # Verificar timeout total de la tarea
+                elapsed_time = time() - task_start_time
+                if elapsed_time > max_task_time:
+                    logging.warning(f"[worker] Thread {_thread} - ⚠ TIMEOUT: Tarea {task['phone']} excedió {max_task_time}s (tiempo: {elapsed_time:.2f}s)")
+                    task['_state'] = False
+                    data_phone = (500, {"message": f"Task timeout after {max_task_time}s"})
+                    break
+                
+                try:
+                    logging.info(f"[worker] Thread {_thread} - Intento {acum + 1} para teléfono: {task['phone']}")
+                    data_phone = digiPhone.get_phone_number(phone=task["phone"])
+                    # Si llegamos aquí sin excepción, resetear contador de errores SSL
+                    ssl_error_count = 0
+                except Exception as e1:
+                    error_str = str(e1)
+                    ip = "Pending"
+                    
+                    # Detectar errores SSL específicos
+                    is_ssl_error = any(ssl_keyword in error_str for ssl_keyword in [
+                        "SSLZeroReturnError", "SSLError", "TLS/SSL connection has been closed",
+                        "Max retries exceeded", "Connection closed", "EOF"
+                    ])
+                    
+                    if is_ssl_error:
+                        ssl_error_count += 1
+                        logging.warning(f"[worker] Thread {_thread} - ⚠ Error SSL #{ssl_error_count} para {task['phone']}: {error_str[:200]}")
+                        
+                        # Cambiar proxy más rápido si hay múltiples errores SSL
+                        if ssl_error_count >= max_ssl_errors:
+                            logging.warning(f"[worker] Thread {_thread} - 🔄 Cambiando proxy después de {ssl_error_count} errores SSL consecutivos")
+                            digiPhone.change_position()
+                            ssl_error_count = 0  # Resetear contador después de cambiar proxy
+                            # Pequeña pausa después de cambiar proxy
+                            sleep(0.5)
+                    else:
+                        logging.info(f"[worker] Thread {_thread} - Error no-SSL: {error_str[:200]}")
+                    
+                    logging.info(f"[worker] Thread {_thread} - IP: {ip} | Proxy: {digiPhone._proxy.password if digiPhone._proxy else 'N/A'} | Usuario: {task['user'].username} | Error: {error_str[:150]}")
+                    data_phone = (401, {"message": f"Error connect {error_str[:100]}"})
+
+                if data_phone[0] in [401, 498]:
+                    logging.info(f"[worker] Thread {_thread} - Reautenticando (401/498) | Usuario: {task['user']} | Archivo: {task['data']['file']}")
+                    try:
+                        digiPhone.get_access("", get_cart=False)
+                    except Exception as e2:
+                        ip = "Pending"
+                        logging.warning(f"[worker] Thread {_thread} - Error en reautenticación: {e2}")
+                        register_block(ip.strip(), task["user"], digiPhone._proxy)
+                        try:
+                            digiPhone.get_access("", get_cart=False)
+                            data_phone = (500, {"message": f"Error connect {str(e2)[:100]}"})
+                        except Exception as e3:
+                            ip = "Pending"
+                            logging.error(f"[worker] Thread {_thread} - Error crítico en reautenticación: {e3}")
+                            register_block(ip.strip(), task["user"], digiPhone._proxy)
+                            data_phone = (500, {"message": f"Error connect {str(e3)[:100]}"})
+                            digiPhone.change_position()
+
+                # Condición de salida: éxito, 404, o máximo de reintentos alcanzado
+                if acum >= 20 or data_phone[0] in [200, 404]:
+                    if acum >= 20 and data_phone[0] not in [200, 404]:
+                        task['_state'] = False
+                        logging.warning(f"[worker] Thread {_thread} - ⚠ Máximo de reintentos alcanzado para {task['phone']} (20 intentos)")
+                    break
+                
+                # Cambiar proxy después de 2 reintentos fallidos (más agresivo)
+                if acum >= 2:
+                    logging.info(f"[worker] Thread {_thread} - 🔄 Cambiando proxy después de {acum} reintentos fallidos")
+                    digiPhone.change_position()
+                    sleep(0.3)  # Pequeña pausa después de cambiar proxy
+                
+                acum += 1
+
+            task_elapsed = time() - task_start_time
+            
+            if task['_state']:
+                operator = None
+                if data_phone[0] == 200:
+                    # Extraer el nombre del operador correctamente
+                    if len(data_phone) >= 2 and isinstance(data_phone[1], dict) and "name" in data_phone[1]:
+                        operator = data_phone[1]["name"]
+                    else:
+                        operator = "No existe"
+                        logging.warning(f"[worker] Thread {_thread} - Formato inesperado en respuesta 200: {data_phone}")
+                elif data_phone[0] == 404:
+                    # 404 con "Operator not found" = número de Digi (no es un error, es un resultado válido)
+                    result = data_phone[1] if len(data_phone) >= 2 else ""
+                    if isinstance(result, dict) and result.get("message") == "Operator not found":
+                        operator = "DIGI SPAIN TELECOM, S.L."
+                    elif isinstance(result, str) and "Operator not found" in result:
+                        operator = "DIGI SPAIN TELECOM, S.L."
+                
+                ip = "Pending"
+                logging.info(f"[worker] Thread {_thread} - ✓ ÉXITO: Teléfono {task['phone']} | Operador: {operator} | Tiempo: {task_elapsed:.2f}s | Usuario: {task['user']} | Archivo: {task['data']['file']}")
+                threading.Thread(target=process_save, args=(task["phone"], operator if operator != None else "No existe", task["user"], task["data"]["file"], ip)).start()
+                task["conse"].progres += 1
+                task["conse"].save()
+                # Cambiar posición del proxy después de éxito
+                digiPhone.change_position()
+            else:
+                logging.warning(f"[worker] Thread {_thread} - ✗ FALLO: Teléfono {task['phone']} | Tiempo: {task_elapsed:.2f}s | Usuario: {task['user']} | Archivo: {task['data']['file']}")
+
+            # Siempre marcar la tarea como completada y señalizar el evento (incluso si falló)
+            q.task_done()
+            if task["name_task"] in events:
+                events[task["name_task"]].set()
+                logging.debug(f"[worker] Thread {_thread} - Evento señalizado para tarea: {task['phone']}")
+            else:
+                logging.warning(f"[worker] Thread {_thread} - ⚠ Evento no encontrado para tarea: {task['phone']} (name_task: {task.get('name_task', 'N/A')})")
+    else:
+        del QUEUE_USER[user.username]
+        logging.info(f"[-] Porfavor asigne proxys - User: {user.username} - Cantidad de proxys actual: {digiPhone._len_proxy}")
+
+#-------------------------------------------------------------------------
+def addUserWithQueue(user, reprocess):
+    if user.username not in list(QUEUE_USER.keys()):
+        QUEUE_USER[user.username] = {
+            "task_queue": queue.Queue(),# Creamos una cola
+            "threads": [],# Creamos una lista para mantener los hilos
+            "task_events": {}
+        }
+        for i in range(4):
+            thread = threading.Thread(target=worker, args=(QUEUE_USER[user.username]["task_queue"],QUEUE_USER[user.username]["task_events"], i, user, reprocess))
+            thread.start()
+            QUEUE_USER[user.username]["threads"].append(thread)
+
+#--------------------------------------------------------------------------
+
+@singleton
+class Segment:
+    USERDATA = {}
+    @classmethod
+    def getter(cls, data):
+        if data["user"] not in list(cls.USERDATA.keys()):
+            cls.USERDATA[data["user"]] = {}
+        if data["file"] not in list(cls.USERDATA[data["user"]].keys()):
+            cls.USERDATA[data["user"]][data["file"]] = {
+                "state": False,
+                "file": data["file"]
+            }
+        return cls.USERDATA[data["user"]][data["file"]]
+    
+    @classmethod
+    def change(cls, data, state):
+        cls.USERDATA[data["user"]][data["file"]]["state"] = state
+    
+    @classmethod
+    def clear(cls, user):
+        del cls.USERDATA[user]
+    
+    @classmethod
+    def check_in_pause(cls, data):
+        result = False
+        if data["user"] in cls.USERDATA.keys():
+            if data["file"] in cls.USERDATA[data["user"]]:
+                result = True
+        return result
+
+def process_save(phone, oper, user, file, ip):
+    
+    cont = 0
+    while True:
+        try:
+            Movil.objects.create(
+                file = file,
+                number = phone,
+                operator = oper,
+                user = user,
+                ip = ip
+            )
+            break
+        except Exception as e:
+            logging.info("Error DB: "+str(e))
+        if cont >= 3:
+            break
+        cont += 1
+
+def register_block(ip, user, proxy):
+    try:
+        bip = BlockIp.objects.filter(ip_block=ip).first()
+        if not bip:
+            bip = BlockIp.objects.create(
+                ip_block = ip,
+                proxy_ip = proxy,
+                user = user
+            )
+        else:
+            bip.reintent += 1
+            bip.save()
+    except Exception as e:
+        logging.info("Error DB: "+str(e))
+
+
+# Extraemos y guardamos a la base de datos.
+def active_process(data):
+    user = User.objects.filter(username=data["user"]).first()
+    if user is None:
+        user = User.objects.create(username=data["user"])
+
+    seg = Segment()
+    seg.change(data, True)
+    conse = Consecutive.objects.filter(file=data["file"]).last()
+    if not conse:
+        conse = Consecutive.objects.create(
+            file = data["file"],
+            total = len(data["number"]),
+            user = user
+        )
+    else:
+        conse.active = True
+        conse.save()
+
+    # Get phone
+    segment = seg.getter(data)
+
+    addUserWithQueue(user, data["reprocess"])
+    sleep(10)
+
+    #theads_process = []
+    if user.username in list(QUEUE_USER.keys()):
+
+        # Dividimos la lista de números en bloques de 10
+        chunks = list(split_into_chunks(data["number"], 10))
+
+        # Usamos ThreadPoolExecutor para procesar los bloques de números en paralelo
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            # Enviar cada bloque a process_block para que se ejecute en paralelo
+            futures = [executor.submit(process_block, seg, chunk, user, data, conse) for chunk in chunks]
+        
+            # Esperamos a que todas las tareas terminen
+            for future in concurrent.futures.as_completed(futures):
+                future.result()
+
+    if segment["state"]:
+        seg.change(data, False)
+    conse.active = False
+    conse.save()
+    logging.info("Proceso finalizado: "+str(data["file"]))
+
+
+def process_block(seg, phones, user, data, conse):
+    """Procesa un bloque de números."""
+    tasks = []
+    for phone in phones:
+        #Consultando en BD local
+        pg_operator = check_scraping_in_db(phone)
+        if pg_operator != None:
+            process_save(phone, pg_operator if pg_operator != None else "No existe", user, data["file"], "postgres")
+            conse.progres += 1
+            conse.save()
+        else:
+            segment = seg.getter(data)
+            if segment["state"]:
+                if not Movil.objects.filter(file=data["file"], user=user, number=phone).first():
+                    _name_task = str(phone) + str(data["file"])
+                    # Agregar la tarea a la cola del usuario
+                    QUEUE_USER[user.username]["task_queue"].put({
+                        "phone": phone,
+                        "user": user,
+                        "conse": conse,
+                        "data": data,
+                        "_state": True,
+                        "name_task": _name_task
+                    })
+                        
+                    # Agregar un evento para la tarea
+                    QUEUE_USER[user.username]["task_events"][_name_task] = threading.Event()
+                        
+                    # No esperar aquí, seguir procesando otros números
+                    tasks.append(_name_task)
+            else:
+                break
+
+    # Esperar a que todas las tareas en este bloque se completen (con timeout para evitar bloqueos)
+    TASK_TIMEOUT = 300  # 5 minutos máximo por tarea
+    for task_name in tasks:
+        event = QUEUE_USER[user.username]["task_events"].get(task_name)
+        if event:
+            # Esperar con timeout para evitar bloqueos indefinidos
+            event_waited = event.wait(timeout=TASK_TIMEOUT)
+            if not event_waited:
+                logging.warning(f"[process_block] ⚠ TIMEOUT: Tarea {task_name} excedió {TASK_TIMEOUT}s - Continuando con siguiente tarea")
+                # Marcar el evento como señalizado para evitar bloqueos futuros
+                event.set()
+        else:
+            logging.warning(f"[process_block] ⚠ Evento no encontrado para tarea: {task_name}")
+
+
+def split_into_chunks(data_list, chunk_size):
+    """Divide una lista en bloques de tamaño chunk_size."""
+    for i in range(0, len(data_list), chunk_size):
+        yield data_list[i:i + chunk_size]
+
+
+
+
+
+
+
+# Función para inicializar Selenium con Selenium Grid
+def init_selenium():
+    chrome_options = Options()
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--headless")  # Ejecutar en modo headless
+
+    driver = webdriver.Remote(
+        command_executor='http://127.0.0.1:4444/wd/hub',
+        options=chrome_options
+    )
+    return driver
+
+
+# Función para procesar los datos en bloques de 10 en paralelo
+def process_file_in_chunks(data, user, file):
+    print("process_file_in_chunks")
+    print(type(data))
+    # `data` es el resultado de df.tolist() y contiene la lista de registros
+    chunks = list(split_into_chunks(data, chunk_size=10))  # Dividir la lista en bloques de 10
+
+    # Usar ThreadPoolExecutor para procesar cada bloque en paralelo
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(process_block, chunk, user, file) for chunk in chunks]  # Enviar cada bloque a un worker
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # Esperar a que todas las tareas terminen
+
+# Función para procesar cada número (una fila del archivo)
+def process_row(row, user, file):
+    driver = init_selenium()
+    
+    try:
+        numero_telefonico = row['number']
+        
+        # Acceder a la página y realizar la operación con Selenium Grid
+        #driver.get("https://www.digimobil.es/combina-telefonia-internet?movil=1333")
+        driver.get("https://www.digimobil.es/combina-telefonia-internet?movil=1498")
+        # Espera hasta que el enlace esté presente en el DOM
+        link = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.ID, 'config_loquiero'))
+        )
+        # Usa JavaScript para hacer clic en el enlace
+        driver.execute_script("arguments[0].click();", link)
+        # Esperar unos segundos para que la redirección ocurra
+        WebDriverWait(driver, 5).until(lambda driver: driver.current_url != 'https://tienda.digimobil.es/')
+        # Capturar la URL redirigida
+        redirected_url = driver.current_url
+        # Localizar el campo de número telefónico
+        phone_input = WebDriverWait(driver, 5).until(
+            EC.presence_of_element_located((By.ID, 'phoneNumber-0'))
+        )
+        # Ingresar el número telefónico
+        phone_input.clear()  # Limpiar cualquier valor previo
+        phone_input.send_keys(numero_telefonico)  # Ingresar el número telefónico
+        sleep(3)
+        operator_value = driver.find_element(By.NAME, 'operator-0').get_attribute('value')
+        logging.info(f"Número: {numero_telefonico}, Operador: {operator_value}")
+        ip = "IP"
+        process_save(numero_telefonico, operator_value, user, file, ip)
+
+    except Exception as e:
+        logging.info(f"Error al procesar {row['number']}: {str(e)}")
+    finally:
+        driver.quit()
+
+
+@api_view(["POST"])
+def process(request):
+    result = {
+        "code": 400,
+        "status": "Fail",
+        "message": ""
+    }
+    data = request.data
+    seg = Segment()
+    segment = seg.getter(data)
+    if not segment["state"]:
+        user = User.objects.filter(username=data["user"]).first()
+        if user is None:
+            user = User.objects.create(username=data["user"])
+        c = Consecutive.objects.filter(user=user).order_by("-id")
+        state = True
+        for conse in c:
+            if conse.active:
+                state = False
+                break 
+        logging.info("Log - process - " + str(user))
+
+        if state:
+            logging.info(f"El tipo de datos de 'data' antes de pasar a active_process es: {type(data)}")
+            threading.Thread(target=active_process, args=(data,)).start()
+            result["code"] = 200
+            result["status"] = "OK"
+            result["message"] = "Proceso activado."
+            logging.info("Proceso activado: "+str(data["file"]))
+        else:
+            result["message"] = "Solo se permite 1 Proceso activado - File"
+            logging.info("Solo se permite 1 Proceso activado - File "+str(data["file"]))
+    else:
+        result["message"] = "Proceso ya estaba activado."
+        logging.info("Proceso ya estaba activado: "+str(data["file"]))
+
+    return Response(result)
+
+@api_view(["POST"])
+def pause(request):
+    data = request.data
+    seg = Segment()
+    result = {
+        "code": 400,
+        "status": "Fail",
+        "message": "No encontrado"
+    }
+
+    ###New inicio 23-10
+    user = User.objects.filter(username=data["user"]).first()
+    qs_conse = Consecutive.objects.filter(user=user, file=data["file"])
+    for obj in qs_conse:
+        obj.active = False
+        obj.save()
+        if seg.check_in_pause(data):
+            seg.change(data, False)
+        result["code"] = 200
+        result["status"] = "OK"
+        result["message"] = "Proceso pausado"
+        logging.info("check_in_pause / Proceso pausado: "+str(data["file"]))
+    ###New-end
+
+    #if seg.check_in_pause(data):
+    #    seg.change(data, False)
+    #    result["code"] = 200
+    #    result["status"] = "OK"
+    #    result["message"] = "Proceso pausado"
+    #    logging.info("Proceso pausado: "+str(data["file"]))
+
+    return Response(result)
+
+@api_view(["POST"])
+def remove(request):
+    data = request.data
+    user = User.objects.filter(username=data["user"]).first()
+    if user is None:
+        user = User.objects.create(username=data["user"])
+    c = Consecutive.objects.filter(id=data["id"]).last()
+    result = {
+        "code": 400,
+        "status": "Fail",
+        "message": "No encontrado"
+    }
+    if c:
+        result["code"] = 200
+        result["status"] = "OK"
+        result["message"] = "Base eliminada correctamente"
+        logging.info("Base eliminada: "+str(c.file))
+        c.delete()
+
+    return Response(result)
+
+@api_view(["POST"])
+def consult(request):
+    data = request.data
+    user = User.objects.filter(username=data["user"]).first()
+    if user is None:
+        user = User.objects.create(username=data["user"])
+    c = Consecutive.objects.filter(id=data["id"]).last()
+    result = {
+        "code": 400,
+        "status": "Fail",
+        "message": "No encontrado",
+        "nameFile": "",
+        "data": {}
+    }
+    if c:
+        data = []
+        for i in Movil.objects.filter(file=c.file).all().order_by("id"):
+            data.append({
+                "number":i.number,
+                "operator":i.operator
+            })
+        total = Movil.objects.filter(user=user).count()
+        result["code"] = 200
+        result["status"] = "OK"
+        result["message"] = "Proceso pausado"
+        result["nameFile"] = c.file
+        result["data"] = {"total": total, "proces": c.progres, "subido": c.total, "list":data}
+    return Response(result)
+
+@api_view(["POST"])
+def filter_data(request):
+    data = request.data
+    print(data)
+    print("SAM filter_data")
+    user = User.objects.filter(username=data["user"]).first()
+    if user is None:
+        user = User.objects.create(username=data["user"])
+    c = Consecutive.objects.filter(user=user).order_by("-id")
+    data = []
+    for i in c:
+        data.append({
+            "id": i.pk,
+            "file": i.file,
+            "total": i.total,
+            "progres": i.progres,
+            "conse": i.num,
+            "created": i.created,
+            "finish": i.finish,
+            "active": i.active
+        })
+    return Response({"data": data})
+
+@api_view(["POST"])
+def phone_consult(request):
+    """
+    Endpoint para consultar un número telefónico individual.
+    Retorna estructura compatible con el frontend: {"data": [status_code, data_or_error]}
+    """
+    result = {"data": [500, "Error interno"]}
+    
+    try:
+        data = request.data
+        logging.info(f"[phone_consult] Request data: {data}")
+        
+        if "user" not in data or "phone" not in data:
+            result["data"] = [400, "Faltan parámetros: user y phone son requeridos"]
+            logging.warning(f"[phone_consult] Faltan parámetros: {data}")
+            return Response(result, status=400)
+        
+        user = User.objects.filter(username=data["user"]).first()
+        if user is None:
+            user = User.objects.create(username=data["user"])
+        
+        digiPhone = DigiPhone(user, None)
+        
+        if digiPhone._len_proxy == 0:
+            result["data"] = [400, "No hay proxies disponibles para este usuario"]
+            logging.warning(f"[phone_consult] No hay proxies para usuario: {data['user']}")
+            return Response(result, status=400)
+        
+        logging.info(f"[phone_consult] Consultando teléfono: {data['phone']} para usuario: {data['user']}")
+        
+        # get_access con get_cart=False porque solo necesitamos consultar el operador
+        # No necesitamos preorder ni cart para get_phone_number()
+        access_success = digiPhone.get_access("", get_cart=False)
+        if not access_success:
+            result["data"] = [500, "Error obteniendo acceso (cookies)"]
+            logging.error(f"[phone_consult] Error obteniendo acceso")
+            return Response(result, status=500)
+        
+        data_phone = digiPhone.get_phone_number(phone=data["phone"])
+        
+        # Formatear respuesta en el formato esperado: [status_code, operator_object]
+        if isinstance(data_phone, tuple):
+            status, result_data = data_phone
+            if status == 200:
+                # Respuesta exitosa - retornar el objeto completo del operador
+                if isinstance(result_data, dict):
+                    result["data"] = [200, result_data]
+                    logging.info(f"[phone_consult] Operador encontrado: {result_data.get('name', 'N/A')} (ID: {result_data.get('operatorId', 'N/A')})")
+                else:
+                    result["data"] = [200, {"name": "Desconocido", "tradeName": "Desconocido"}]
+                    logging.warning(f"[phone_consult] Formato inesperado en respuesta 200: {result_data}")
+            elif status == 404:
+                # 404 con "Operator not found" = número de Digi
+                if isinstance(result_data, dict) and result_data.get("message") == "Operator not found":
+                    # Retornar como exitoso con el objeto del operador Digi
+                    result["data"] = [200, {
+                        "name": "DIGI SPAIN TELECOM, S.L.",
+                        "tradeName": "DIGI SPAIN TELECOM, S.L.",
+                        "operatorId": None
+                    }]
+                    logging.info(f"[phone_consult] Operador: DIGI SPAIN TELECOM, S.L. (Operator not found - Digi)")
+                elif isinstance(result_data, str) and "Operator not found" in result_data:
+                    # Retornar como exitoso con el objeto del operador Digi
+                    result["data"] = [200, {
+                        "name": "DIGI SPAIN TELECOM, S.L.",
+                        "tradeName": "DIGI SPAIN TELECOM, S.L.",
+                        "operatorId": None
+                    }]
+                    logging.info(f"[phone_consult] Operador: DIGI SPAIN TELECOM, S.L. (Operator not found - Digi)")
+                else:
+                    # Otro tipo de 404
+                    error_msg = result_data if isinstance(result_data, str) else str(result_data)
+                    result["data"] = [404, error_msg]
+                    logging.warning(f"[phone_consult] Error 404: {error_msg}")
+            else:
+                # Otros errores
+                error_msg = result_data if isinstance(result_data, str) else str(result_data)
+                result["data"] = [status, error_msg]
+                logging.warning(f"[phone_consult] Error {status}: {error_msg}")
+        else:
+            # Formato inesperado
+            result["data"] = [500, f"Formato de respuesta inesperado: {str(data_phone)}"]
+            logging.error(f"[phone_consult] Formato inesperado: {type(data_phone)} - {data_phone}")
+        
+    except Exception as e:
+        logging.exception(f"[phone_consult] Error inesperado: {e}")
+        result["data"] = [500, str(e)]
+    
+    logging.info(f"[phone_consult] Respuesta final: data[0]={result['data'][0]}")
+    return Response(result)

@@ -158,7 +158,6 @@ CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'  # Redis también como backen
 #            'NAME': BASE_DIR / 'db.sqlite3',
 #        }
 #    }
-
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
