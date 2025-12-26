@@ -37,18 +37,11 @@ class DigiPhone:
         #    self.proxys = Proxy.objects.filter(user=user).first()
         logging.info(f"proxys: {str(self.proxys)}")
         self.proxies = []
-        
-        # Circuit breaker: tracking de errores SSL y conexión por proxy
-        # Formato: {proxy_id: {"ssl_errors": count, "connection_errors": count, "last_error_time": timestamp, "disabled_until": timestamp}}
-        self._proxy_health = {}
-        self._max_ssl_errors_per_proxy = 5  # Deshabilitar proxy después de 5 errores SSL
-        self._max_connection_errors_per_proxy = 5  # Deshabilitar proxy después de 5 errores de conexión
-        self._proxy_cooldown = 300  # 5 minutos de cooldown para proxies deshabilitados
 
         if self.proxys.count() == 1:
             p = self.proxys.first()
             usernames = [u.strip() for u in p.username.splitlines() if u.strip()]
-            for idx, uname in enumerate(usernames):
+            for uname in usernames:
                 print(f"username: {uname} - password: {p.password} - ip: {p.ip} - port: {p.port_min}")
                 # Crear sesión para mantener cookies
                 session = requests.Session()
@@ -56,7 +49,6 @@ class DigiPhone:
                     "http": f"socks5h://{uname}:{p.password}@{p.ip}:{p.port_min}",
                     "https": f"socks5h://{uname}:{p.password}@{p.ip}:{p.port_min}"
                 }
-                proxy_id = f"{p.ip}:{p.port_min}:{uname}"
                 self.proxies.append({
                     "proxy": {
                         "http": f"socks5h://{uname}:{p.password}@{p.ip}:{p.port_min}",
@@ -67,16 +59,8 @@ class DigiPhone:
                     "preorder": None,
                     "product": None,
                     "item": p,
-                    "cart": None,
-                    "proxy_id": proxy_id  # ID único para tracking
+                    "cart": None
                 })
-                # Inicializar health tracking
-                self._proxy_health[proxy_id] = {
-                    "ssl_errors": 0,
-                    "connection_errors": 0,
-                    "last_error_time": None,
-                    "disabled_until": None
-                }
         else:
             #if self.proxys:
             for p in self.proxys:#range(int(self.proxys.port_min), int(self.proxys.port_max), 1):
@@ -86,7 +70,6 @@ class DigiPhone:
                     "http": f"socks5h://{p.username}:{p.password}@{p.ip}:{p.port_min}",
                     "https": f"socks5h://{p.username}:{p.password}@{p.ip}:{p.port_min}"
                 }
-                proxy_id = f"{p.ip}:{p.port_min}:{p.username}"
                 self.proxies.append({
                     "proxy": {
                         "http": f"socks5h://{p.username}:{p.password}@{p.ip}:{p.port_min}",
@@ -97,16 +80,8 @@ class DigiPhone:
                     "preorder": None,
                     "product": None,
                     "item": p,
-                    "cart": None,
-                    "proxy_id": proxy_id  # ID único para tracking
+                    "cart": None
                 })
-                # Inicializar health tracking
-                self._proxy_health[proxy_id] = {
-                    "ssl_errors": 0,
-                    "connection_errors": 0,
-                    "last_error_time": None,
-                    "disabled_until": None
-                }
 
         self.position = 0
 
@@ -124,115 +99,10 @@ class DigiPhone:
         return self.proxies[self.position]["item"]
 
     def change_position(self):
-        """
-        Cambia a la siguiente posición de proxy, saltando proxies deshabilitados por circuit breaker.
-        """
-        original_position = self.position
-        attempts = 0
-        max_attempts = len(self.proxies) * 2  # Evitar bucle infinito
-        
-        while attempts < max_attempts:
-            if self.position < len(self.proxies) - 1:
-                self.position += 1
-            else:
-                self.position = 0
-            
-            # Verificar si el proxy actual está disponible (no deshabilitado)
-            current_proxy_id = self.proxies[self.position].get("proxy_id")
-            if current_proxy_id:
-                health = self._proxy_health.get(current_proxy_id, {})
-                disabled_until = health.get("disabled_until")
-                
-                if disabled_until is None:
-                    # Proxy disponible
-                    if original_position != self.position:
-                        logging.info(f"[change_position] Cambiado de proxy {original_position} a {self.position} (proxy_id: {current_proxy_id})")
-                    return
-                else:
-                    # Verificar si el cooldown ya expiró
-                    from time import time
-                    if time() < disabled_until:
-                        # Proxy aún en cooldown, continuar al siguiente
-                        logging.debug(f"[change_position] Proxy {current_proxy_id} aún en cooldown, saltando...")
-                        attempts += 1
-                        continue
-                    else:
-                        # Cooldown expirado, reactivar proxy
-                        logging.info(f"[change_position] Reactivando proxy {current_proxy_id} (cooldown expirado)")
-                        health["ssl_errors"] = 0
-                        health["disabled_until"] = None
-                        return
-            
-            attempts += 1
-        
-        # Si todos los proxies están deshabilitados, usar el primero de todos modos
-        if original_position != self.position:
-            logging.warning(f"[change_position] Todos los proxies en cooldown, usando posición {self.position} de todos modos")
-    
-    def _record_ssl_error(self, error_message):
-        """
-        Registra un error SSL para el proxy actual y lo deshabilita si excede el límite.
-        """
-        current_proxy_id = self.proxies[self.position].get("proxy_id")
-        if not current_proxy_id:
-            return
-        
-        from time import time
-        health = self._proxy_health.get(current_proxy_id, {
-            "ssl_errors": 0,
-            "connection_errors": 0,
-            "last_error_time": None,
-            "disabled_until": None
-        })
-        health["ssl_errors"] = health.get("ssl_errors", 0) + 1
-        health["last_error_time"] = time()
-        
-        total_errors = health["ssl_errors"] + health.get("connection_errors", 0)
-        if health["ssl_errors"] >= self._max_ssl_errors_per_proxy or total_errors >= (self._max_ssl_errors_per_proxy + self._max_connection_errors_per_proxy) // 2:
-            health["disabled_until"] = time() + self._proxy_cooldown
-            logging.warning(f"[_record_ssl_error] ⚠ Proxy {current_proxy_id} DESHABILITADO por {self._proxy_cooldown}s (errores SSL: {health['ssl_errors']}, total: {total_errors})")
-        
-        self._proxy_health[current_proxy_id] = health
-    
-    def _record_connection_error(self, error_message):
-        """
-        Registra un error de conexión para el proxy actual y lo deshabilita si excede el límite.
-        """
-        current_proxy_id = self.proxies[self.position].get("proxy_id")
-        if not current_proxy_id:
-            return
-        
-        from time import time
-        health = self._proxy_health.get(current_proxy_id, {
-            "ssl_errors": 0,
-            "connection_errors": 0,
-            "last_error_time": None,
-            "disabled_until": None
-        })
-        health["connection_errors"] = health.get("connection_errors", 0) + 1
-        health["last_error_time"] = time()
-        
-        total_errors = health["ssl_errors"] + health["connection_errors"]
-        if health["connection_errors"] >= self._max_connection_errors_per_proxy or total_errors >= (self._max_ssl_errors_per_proxy + self._max_connection_errors_per_proxy) // 2:
-            health["disabled_until"] = time() + self._proxy_cooldown
-            logging.warning(f"[_record_connection_error] ⚠ Proxy {current_proxy_id} DESHABILITADO por {self._proxy_cooldown}s (errores conexión: {health['connection_errors']}, total: {total_errors})")
-        
-        self._proxy_health[current_proxy_id] = health
-    
-    def _reset_proxy_errors(self):
-        """
-        Resetea los contadores de errores SSL y conexión para el proxy actual (cuando hay éxito).
-        """
-        current_proxy_id = self.proxies[self.position].get("proxy_id")
-        if current_proxy_id and current_proxy_id in self._proxy_health:
-            health = self._proxy_health[current_proxy_id]
-            ssl_errors = health.get("ssl_errors", 0)
-            conn_errors = health.get("connection_errors", 0)
-            if ssl_errors > 0 or conn_errors > 0:
-                logging.debug(f"[_reset_proxy_errors] Reseteando errores para proxy {current_proxy_id} (SSL: {ssl_errors}, Conexión: {conn_errors})")
-                health["ssl_errors"] = 0
-                health["connection_errors"] = 0
-                health["last_error_time"] = None
+        if self.position < len(self.proxies) - 1:
+            self.position += 1
+        else:
+            self.position = 0
 
     def update_cart(self):
         """
@@ -318,7 +188,6 @@ class DigiPhone:
     def get_phone_number(self, phone):
         """
         Obtiene información del operador de un número usando cookies (store_access_token).
-        Incluye detección de errores SSL y registro en circuit breaker.
         """
         url = f"https://store-backend.digimobil.es/v2/operators/by-line-code/{phone}"
 
@@ -339,50 +208,18 @@ class DigiPhone:
         }
 
         session = self.proxies[self.position]["session"]
-        current_proxy_id = self.proxies[self.position].get("proxy_id", "unknown")
-        logging.info(f"[get_phone_number] URL: {url} | Proxy: {current_proxy_id}")
+        logging.info(f"[get_phone_number] URL: {url}")
         logging.info(f"[get_phone_number] Cookies disponibles: {list(session.cookies.keys())}")
         
         try:
             response = session.get(url, headers=headers, timeout=40)
             logging.info(f"[get_phone_number] Status: {response.status_code} | Body: {response.text[:200]}...")
-            
-            # Si la respuesta es exitosa, resetear errores SSL del proxy
-            if response.status_code in [200, 404]:
-                self._reset_proxy_errors()
-            
             if response.status_code == 200:
                 return response.status_code, response.json()
             else:
                 return response.status_code, response.text
         except Exception as e:
-            error_str = str(e)
-            error_type = type(e).__name__
-            
-            # Detectar errores SSL específicos
-            is_ssl_error = any(ssl_keyword in error_str for ssl_keyword in [
-                "SSLZeroReturnError", "SSLError", "TLS/SSL connection has been closed",
-                "Max retries exceeded", "Connection closed", "EOF", "_ssl.c:"
-            ])
-            
-            # Detectar errores de conexión (RemoteDisconnected, ConnectionError, ProtocolError)
-            is_connection_error = any(conn_keyword in error_str or conn_keyword in error_type for conn_keyword in [
-                "RemoteDisconnected", "Connection aborted", "ConnectionError",
-                "ProtocolError", "Remote end closed connection", "Connection reset",
-                "Broken pipe", "Connection refused", "timeout", "Read timed out"
-            ])
-            
-            if is_ssl_error:
-                # Registrar error SSL en circuit breaker
-                self._record_ssl_error(error_str)
-                logging.warning(f"[get_phone_number] ⚠ Error SSL detectado para proxy {current_proxy_id}: {error_str[:200]}")
-            elif is_connection_error:
-                # Registrar error de conexión (similar a SSL, pero con tracking separado)
-                self._record_connection_error(error_str)
-                logging.warning(f"[get_phone_number] ⚠ Error de conexión detectado para proxy {current_proxy_id}: {error_type} - {error_str[:200]}")
-            else:
-                logging.exception(f"[get_phone_number] ✗ Error desconocido: {error_type} - {e}")
-            
+            logging.exception(f"[get_phone_number] Error: {e}")
             return 500, str(e)
 
     # Get phone number

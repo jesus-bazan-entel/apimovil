@@ -38,11 +38,10 @@ class DigiPhone:
         logging.info(f"proxys: {str(self.proxys)}")
         self.proxies = []
         
-        # Circuit breaker: tracking de errores SSL y conexión por proxy
-        # Formato: {proxy_id: {"ssl_errors": count, "connection_errors": count, "last_error_time": timestamp, "disabled_until": timestamp}}
+        # Circuit breaker: tracking de errores SSL por proxy
+        # Formato: {proxy_id: {"ssl_errors": count, "last_error_time": timestamp, "disabled_until": timestamp}}
         self._proxy_health = {}
         self._max_ssl_errors_per_proxy = 5  # Deshabilitar proxy después de 5 errores SSL
-        self._max_connection_errors_per_proxy = 5  # Deshabilitar proxy después de 5 errores de conexión
         self._proxy_cooldown = 300  # 5 minutos de cooldown para proxies deshabilitados
 
         if self.proxys.count() == 1:
@@ -71,12 +70,7 @@ class DigiPhone:
                     "proxy_id": proxy_id  # ID único para tracking
                 })
                 # Inicializar health tracking
-                self._proxy_health[proxy_id] = {
-                    "ssl_errors": 0,
-                    "connection_errors": 0,
-                    "last_error_time": None,
-                    "disabled_until": None
-                }
+                self._proxy_health[proxy_id] = {"ssl_errors": 0, "last_error_time": None, "disabled_until": None}
         else:
             #if self.proxys:
             for p in self.proxys:#range(int(self.proxys.port_min), int(self.proxys.port_max), 1):
@@ -101,12 +95,7 @@ class DigiPhone:
                     "proxy_id": proxy_id  # ID único para tracking
                 })
                 # Inicializar health tracking
-                self._proxy_health[proxy_id] = {
-                    "ssl_errors": 0,
-                    "connection_errors": 0,
-                    "last_error_time": None,
-                    "disabled_until": None
-                }
+                self._proxy_health[proxy_id] = {"ssl_errors": 0, "last_error_time": None, "disabled_until": None}
 
         self.position = 0
 
@@ -178,60 +167,26 @@ class DigiPhone:
             return
         
         from time import time
-        health = self._proxy_health.get(current_proxy_id, {
-            "ssl_errors": 0,
-            "connection_errors": 0,
-            "last_error_time": None,
-            "disabled_until": None
-        })
+        health = self._proxy_health.get(current_proxy_id, {"ssl_errors": 0, "last_error_time": None, "disabled_until": None})
         health["ssl_errors"] = health.get("ssl_errors", 0) + 1
         health["last_error_time"] = time()
         
-        total_errors = health["ssl_errors"] + health.get("connection_errors", 0)
-        if health["ssl_errors"] >= self._max_ssl_errors_per_proxy or total_errors >= (self._max_ssl_errors_per_proxy + self._max_connection_errors_per_proxy) // 2:
+        if health["ssl_errors"] >= self._max_ssl_errors_per_proxy:
             health["disabled_until"] = time() + self._proxy_cooldown
-            logging.warning(f"[_record_ssl_error] ⚠ Proxy {current_proxy_id} DESHABILITADO por {self._proxy_cooldown}s (errores SSL: {health['ssl_errors']}, total: {total_errors})")
-        
-        self._proxy_health[current_proxy_id] = health
-    
-    def _record_connection_error(self, error_message):
-        """
-        Registra un error de conexión para el proxy actual y lo deshabilita si excede el límite.
-        """
-        current_proxy_id = self.proxies[self.position].get("proxy_id")
-        if not current_proxy_id:
-            return
-        
-        from time import time
-        health = self._proxy_health.get(current_proxy_id, {
-            "ssl_errors": 0,
-            "connection_errors": 0,
-            "last_error_time": None,
-            "disabled_until": None
-        })
-        health["connection_errors"] = health.get("connection_errors", 0) + 1
-        health["last_error_time"] = time()
-        
-        total_errors = health["ssl_errors"] + health["connection_errors"]
-        if health["connection_errors"] >= self._max_connection_errors_per_proxy or total_errors >= (self._max_ssl_errors_per_proxy + self._max_connection_errors_per_proxy) // 2:
-            health["disabled_until"] = time() + self._proxy_cooldown
-            logging.warning(f"[_record_connection_error] ⚠ Proxy {current_proxy_id} DESHABILITADO por {self._proxy_cooldown}s (errores conexión: {health['connection_errors']}, total: {total_errors})")
+            logging.warning(f"[_record_ssl_error] ⚠ Proxy {current_proxy_id} DESHABILITADO por {self._proxy_cooldown}s (errores SSL: {health['ssl_errors']})")
         
         self._proxy_health[current_proxy_id] = health
     
     def _reset_proxy_errors(self):
         """
-        Resetea los contadores de errores SSL y conexión para el proxy actual (cuando hay éxito).
+        Resetea el contador de errores SSL para el proxy actual (cuando hay éxito).
         """
         current_proxy_id = self.proxies[self.position].get("proxy_id")
         if current_proxy_id and current_proxy_id in self._proxy_health:
             health = self._proxy_health[current_proxy_id]
-            ssl_errors = health.get("ssl_errors", 0)
-            conn_errors = health.get("connection_errors", 0)
-            if ssl_errors > 0 or conn_errors > 0:
-                logging.debug(f"[_reset_proxy_errors] Reseteando errores para proxy {current_proxy_id} (SSL: {ssl_errors}, Conexión: {conn_errors})")
+            if health.get("ssl_errors", 0) > 0:
+                logging.debug(f"[_reset_proxy_errors] Reseteando errores SSL para proxy {current_proxy_id} (tenía {health['ssl_errors']} errores)")
                 health["ssl_errors"] = 0
-                health["connection_errors"] = 0
                 health["last_error_time"] = None
 
     def update_cart(self):
@@ -357,31 +312,18 @@ class DigiPhone:
                 return response.status_code, response.text
         except Exception as e:
             error_str = str(e)
-            error_type = type(e).__name__
-            
             # Detectar errores SSL específicos
             is_ssl_error = any(ssl_keyword in error_str for ssl_keyword in [
                 "SSLZeroReturnError", "SSLError", "TLS/SSL connection has been closed",
                 "Max retries exceeded", "Connection closed", "EOF", "_ssl.c:"
             ])
             
-            # Detectar errores de conexión (RemoteDisconnected, ConnectionError, ProtocolError)
-            is_connection_error = any(conn_keyword in error_str or conn_keyword in error_type for conn_keyword in [
-                "RemoteDisconnected", "Connection aborted", "ConnectionError",
-                "ProtocolError", "Remote end closed connection", "Connection reset",
-                "Broken pipe", "Connection refused", "timeout", "Read timed out"
-            ])
-            
             if is_ssl_error:
                 # Registrar error SSL en circuit breaker
                 self._record_ssl_error(error_str)
-                logging.warning(f"[get_phone_number] ⚠ Error SSL detectado para proxy {current_proxy_id}: {error_str[:200]}")
-            elif is_connection_error:
-                # Registrar error de conexión (similar a SSL, pero con tracking separado)
-                self._record_connection_error(error_str)
-                logging.warning(f"[get_phone_number] ⚠ Error de conexión detectado para proxy {current_proxy_id}: {error_type} - {error_str[:200]}")
+                logging.warning(f"[get_phone_number] Error SSL detectado para proxy {current_proxy_id}: {error_str[:200]}")
             else:
-                logging.exception(f"[get_phone_number] ✗ Error desconocido: {error_type} - {e}")
+                logging.exception(f"[get_phone_number] Error no-SSL: {e}")
             
             return 500, str(e)
 

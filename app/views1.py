@@ -28,8 +28,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys  # Importar Keys para presionar Enter
 from selenium.common.exceptions import TimeoutException
 import os
-from django.db import close_old_connections, transaction
-from django.db.utils import OperationalError
+from django.db import close_old_connections
 
 def borrar_movil_por_lotes(user, batch_size=1000):
     while True:
@@ -135,38 +134,28 @@ _logging = logging.basicConfig(filename="logger.log", level=logging.INFO)
 
 
 def check_scraping_in_db(number):
-    """
-    Verifica si un número ya existe en la base de datos (últimos 30 días).
-    Incluye manejo de errores de DB bloqueada.
-    """
+    # Definimos el umbral de 30 días
     thirty_days_ago = timezone.now() - timedelta(days=30)
-    max_retries = 3
-    base_delay = 0.05
-    
-    for attempt in range(max_retries):
+    # Buscamos el número en la base de datos donde ip='Pending' y fecha_hora < 30 días
+    cont = 0
+    while True:
         try:
-            close_old_connections()
             result = Movil.objects.filter(
                 number=number,
                 ip='Pending',
                 fecha_hora__gte=thirty_days_ago
             ).order_by('-fecha_hora').first()
-            return result.operator if result else None
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                delay = base_delay * (2 ** attempt)
-                logging.debug(f"[check_scraping_in_db] ⚠ DB locked para {number} (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.warning(f"[check_scraping_in_db] ✗ OperationalError para {number}: {error_str}")
-                return None
+            break
         except Exception as e:
-            logging.warning(f"[check_scraping_in_db] ✗ Error DB para {number}: {str(e)}")
-            if attempt >= max_retries - 1:
-                return None
-    
-    return None
+            result = None
+            logging.info(f"Error Check DB: {e}")
+        if cont >= 3:
+            break
+        cont += 1
+    # Buscamos el número en la base de datos
+    #result = Movil.objects.filter(number=number).first()
+    # Retornamos solo el número si existe, o None si no se encuentra
+    return result.operator if result else None
 
 
 QUEUE_USER = {}
@@ -179,17 +168,6 @@ QUEUE_USER = {}
 def worker(q, events, _thread, user, reprocess):
     digiPhone = DigiPhone(user, reprocess)
     if digiPhone._len_proxy > 0:
-        # Cerrar conexiones viejas al inicio del worker (importante para threads)
-        close_old_connections()
-        
-        # Obtener acceso (cookies) al inicio para tenerlas listas
-        try:
-            logging.info(f"[worker] Thread {_thread} - Obteniendo acceso inicial (cookies)...")
-            digiPhone.get_access("", get_cart=False)
-            logging.info(f"[worker] Thread {_thread} - ✓ Acceso obtenido correctamente")
-        except Exception as e_init:
-            logging.warning(f"[worker] Thread {_thread} - ⚠ Error obteniendo acceso inicial: {e_init} (se intentará obtener en cada tarea)")
-        
         cont = 0
         while True:
             # Obtenemos una tarea de la cola
@@ -197,117 +175,84 @@ def worker(q, events, _thread, user, reprocess):
             if task is None:
                 # Si la tarea es None, salimos del bucle
                 break
-            
-            task_start_time = time()
-            logging.info(f"[worker] Thread {_thread} - Iniciando tarea: {task['phone']} | Usuario: {task['user'].username} | Archivo: {task['data']['file']}")
+            logging.info(f"Processing task: {task['phone']} {task['user'].username} {task['data']['file']}")
+            # Simulamos un trabajo que tarda 1 segundo
 
             acum = 0
-            ssl_error_count = 0  # Contador de errores SSL consecutivos
-            max_task_time = 180  # Timeout máximo por tarea: 3 minutos
-            max_ssl_errors = 3  # Cambiar proxy después de 3 errores SSL consecutivos
-            
             while True:
-                # Verificar timeout total de la tarea
-                elapsed_time = time() - task_start_time
-                if elapsed_time > max_task_time:
-                    logging.warning(f"[worker] Thread {_thread} - ⚠ TIMEOUT: Tarea {task['phone']} excedió {max_task_time}s (tiempo: {elapsed_time:.2f}s)")
-                    task['_state'] = False
-                    data_phone = (500, {"message": f"Task timeout after {max_task_time}s"})
-                    break
-                
                 try:
-                    logging.info(f"[worker] Thread {_thread} - Intento {acum + 1} para teléfono: {task['phone']}")
+                    logging.info(f"S.A.M. worker for phone: {task['phone']}") 
                     data_phone = digiPhone.get_phone_number(phone=task["phone"])
-                    # Si llegamos aquí sin excepción, resetear contador de errores SSL
-                    ssl_error_count = 0
                 except Exception as e1:
-                    error_str = str(e1)
+                    ###JBL###logging.info(f"Exception {e1} in task: {task}")
+                    # try:
+                    #    ip = digiPhone.check_ip()
+                    #    ip = ip["ip"]
+                    # except Exception as eip:
+                    #    logging.info("[-] Error get ip: "+str(eip))
+                    #    ip = "Error: "+str(eip)
                     ip = "Pending"
-                    
-                    # Detectar errores SSL específicos
-                    is_ssl_error = any(ssl_keyword in error_str for ssl_keyword in [
-                        "SSLZeroReturnError", "SSLError", "TLS/SSL connection has been closed",
-                        "Max retries exceeded", "Connection closed", "EOF"
-                    ])
-                    
-                    # Detectar errores de conexión (RemoteDisconnected, ConnectionError, etc.)
-                    error_type = type(e1).__name__
-                    is_connection_error = any(conn_keyword in error_str or conn_keyword in error_type for conn_keyword in [
-                        "RemoteDisconnected", "Connection aborted", "ConnectionError",
-                        "ProtocolError", "Remote end closed connection", "Connection reset",
-                        "Broken pipe", "Connection refused"
-                    ])
-                    
-                    if is_ssl_error:
-                        ssl_error_count += 1
-                        logging.warning(f"[worker] Thread {_thread} - ⚠ Error SSL #{ssl_error_count} para {task['phone']}: {error_str[:200]}")
-                        
-                        # Cambiar proxy más rápido si hay múltiples errores SSL
-                        if ssl_error_count >= max_ssl_errors:
-                            logging.warning(f"[worker] Thread {_thread} - 🔄 Cambiando proxy después de {ssl_error_count} errores SSL consecutivos")
-                            digiPhone.change_position()
-                            ssl_error_count = 0  # Resetear contador después de cambiar proxy
-                            sleep(0.5)
-                    elif is_connection_error:
-                        ssl_error_count += 1  # Usar el mismo contador para ambos tipos de errores
-                        logging.warning(f"[worker] Thread {_thread} - ⚠ Error de conexión #{ssl_error_count} para {task['phone']}: {error_type} - {error_str[:200]}")
-                        
-                        # Cambiar proxy más rápido si hay múltiples errores de conexión
-                        if ssl_error_count >= max_ssl_errors:
-                            logging.warning(f"[worker] Thread {_thread} - 🔄 Cambiando proxy después de {ssl_error_count} errores de conexión consecutivos")
-                            digiPhone.change_position()
-                            ssl_error_count = 0
-                            sleep(0.5)
-                    else:
-                        logging.info(f"[worker] Thread {_thread} - Error desconocido: {error_type} - {error_str[:200]}")
-                    
-                    logging.info(f"[worker] Thread {_thread} - IP: {ip} | Proxy: {digiPhone._proxy.password if digiPhone._proxy else 'N/A'} | Usuario: {task['user'].username} | Error: {error_str[:150]}")
-                    data_phone = (401, {"message": f"Error connect {error_str[:100]}"})
+                    logging.info(f"[-] Thread:{_thread} - IP: {ip} - {digiPhone._proxy.password if digiPhone._proxy else ''} - {task['user'].username} - Error1 83: "+str(e1))
+
+                    #register_block(ip.strip(), task["user"], digiPhone._proxy)
+
+                    #digiPhone.get_access()
+                    data_phone = (401, {"message": f"Error connect {e1}"})
+                    #sleep(2)
 
                 if data_phone[0] in [401, 498]:
-                    logging.info(f"[worker] Thread {_thread} - Reautenticando (401/498) | Usuario: {task['user']} | Archivo: {task['data']['file']}")
+                    logging.info(f"[-] Check cookies <-> Usuario: {task['user']} <-> File: {task['data']['file']} <-> Thread: {_thread}")
+                    #logging.info(data_phone)
                     try:
-                        digiPhone.get_access("", get_cart=False)
+                        # get_access ahora usa cookies, el parámetro token se mantiene por compatibilidad pero ya no se usa
+                        digiPhone.get_access("")
                     except Exception as e2:
+                        # try:
+                        #    ip = digiPhone.check_ip()
+                        #    ip = ip["ip"]
+                        # except Exception as eip:
+                        #    logging.info("[-] Error get ip: "+str(eip))
+                        #    ip = "Error: "+str(eip)
                         ip = "Pending"
-                        logging.warning(f"[worker] Thread {_thread} - Error en reautenticación: {e2}")
+                        logging.info(f"[-] Thread:{_thread} - IP:{ip} - {digiPhone._proxy.password if digiPhone._proxy else ''} - {task['user'].username} - Error2 94: "+str(e2))
+
                         register_block(ip.strip(), task["user"], digiPhone._proxy)
                         try:
-                            digiPhone.get_access("", get_cart=False)
-                            data_phone = (500, {"message": f"Error connect {str(e2)[:100]}"})
-                        except Exception as e3:
+                            digiPhone.get_access()
+                            data_phone = (500, {"message": f"Error connect {e2}"})
+                        except Exception as e2:
+                            # try:
+                            #    ip = digiPhone.check_ip()
+                            #    ip = ip["ip"]
+                            # except Exception as eip:
+                            #    logging.info("[-] Error get ip: "+str(eip))
+                            #    ip = "Error: "+str(eip)
                             ip = "Pending"
-                            logging.error(f"[worker] Thread {_thread} - Error crítico en reautenticación: {e3}")
+                            logging.info(f"[-] Thread:{_thread} - IP:{ip} - {digiPhone._proxy.password if digiPhone._proxy else ''} - {task['user'].username} - Error2 94: "+str(e2))
                             register_block(ip.strip(), task["user"], digiPhone._proxy)
-                            data_phone = (500, {"message": f"Error connect {str(e3)[:100]}"})
+                            data_phone = (500, {"message": f"Error connect {e2}"})
                             digiPhone.change_position()
+                        #sleep(2)
 
-                # Condición de salida: éxito, 404, o máximo de reintentos alcanzado
+                #SAM 02-09-24: se quita restriccion de acum = 20
                 if acum >= 20 or data_phone[0] in [200, 404]:
                     if acum >= 20 and data_phone[0] not in [200, 404]:
                         task['_state'] = False
-                        logging.warning(f"[worker] Thread {_thread} - ⚠ Máximo de reintentos alcanzado para {task['phone']} (20 intentos)")
                     break
+                #if data_phone["_info"]["status"] not in [201, 400]:
+                #    task['_state'] = False
+                #
                 
-                # Cambiar proxy después de 2 reintentos fallidos (más agresivo)
-                if acum >= 2:
-                    logging.info(f"[worker] Thread {_thread} - 🔄 Cambiando proxy después de {acum} reintentos fallidos")
+                #SAM 02-09-2024: cambio de variable acum de 10 a 2
+                if acum > 2:
+                    # change position proxy si hace 10 reintentos
                     digiPhone.change_position()
-                    sleep(0.3)  # Pequeña pausa después de cambiar proxy
-                
                 acum += 1
 
-            task_elapsed = time() - task_start_time
-            
             if task['_state']:
                 operator = None
                 if data_phone[0] == 200:
-                    # Extraer el nombre del operador correctamente
-                    if len(data_phone) >= 2 and isinstance(data_phone[1], dict) and "name" in data_phone[1]:
-                        operator = data_phone[1]["name"]
-                    else:
-                        operator = "No existe"
-                        logging.warning(f"[worker] Thread {_thread} - Formato inesperado en respuesta 200: {data_phone}")
+                    operator = data_phone[1]["name"] if len(data_phone) >= 2 and "name" in data_phone[1] != None else "No existe"
                 elif data_phone[0] == 404:
                     # 404 con "Operator not found" = número de Digi (no es un error, es un resultado válido)
                     result = data_phone[1] if len(data_phone) >= 2 else ""
@@ -316,26 +261,29 @@ def worker(q, events, _thread, user, reprocess):
                     elif isinstance(result, str) and "Operator not found" in result:
                         operator = "DIGI SPAIN TELECOM, S.L."
                 
+                # try:
+                #    ip = digiPhone.check_ip()
+                #    ip = ip["ip"]
+                # except Exception as eip:
+                #    logging.info("[-] Error get ip: "+str(eip))
+                #    ip = "Error: "+str(eip)
                 ip = "Pending"
-                logging.info(f"[worker] Thread {_thread} - ✓ ÉXITO: Teléfono {task['phone']} | Operador: {operator} | Tiempo: {task_elapsed:.2f}s | Usuario: {task['user']} | Archivo: {task['data']['file']}")
+                logging.info(f"[+] Phone: {task['phone']} - Operator: {operator} - IP: {ip} - Usuario: {task['user']} - File: {task['data']['file']} - Thread: {_thread}")
+                #if operator != None:
                 threading.Thread(target=process_save, args=(task["phone"], operator if operator != None else "No existe", task["user"], task["data"]["file"], ip)).start()
-                
-                # Actualizar progreso con manejo de errores de DB
                 task["conse"].progres += 1
-                _save_consecutive_with_retry(task["conse"], _thread, max_retries=3)
-                
-                # Cambiar posición del proxy después de éxito
+                task["conse"].save()
+                # change position proxy
                 digiPhone.change_position()
-            else:
-                logging.warning(f"[worker] Thread {_thread} - ✗ FALLO: Teléfono {task['phone']} | Tiempo: {task_elapsed:.2f}s | Usuario: {task['user']} | Archivo: {task['data']['file']}")
+                #sleep(3)
+                # += 1
+                #if cont == 100:
+                    #sleep(30)
+                #    cont = 0
 
-            # Siempre marcar la tarea como completada y señalizar el evento (incluso si falló)
-            q.task_done()
-            if task["name_task"] in events:
-                events[task["name_task"]].set()
-                logging.debug(f"[worker] Thread {_thread} - Evento señalizado para tarea: {task['phone']}")
-            else:
-                logging.warning(f"[worker] Thread {_thread} - ⚠ Evento no encontrado para tarea: {task['phone']} (name_task: {task.get('name_task', 'N/A')})")
+            #logging.info(f"Completed task: {task['phone']} {task['user'].username} {task['data']['file']}")
+            q.task_done()  # Marcamos la tarea como completada
+            events[task["name_task"]].set()
     else:
         del QUEUE_USER[user.username]
         logging.info(f"[-] Porfavor asigne proxys - User: {user.username} - Cantidad de proxys actual: {digiPhone._len_proxy}")
@@ -385,46 +333,11 @@ class Segment:
                 result = True
         return result
 
-def _save_consecutive_with_retry(conse, thread_id, max_retries=3):
-    """
-    Guarda el objeto Consecutive con retry para manejar errores de DB bloqueada.
-    """
-    base_delay = 0.05  # 50ms base delay
-    
-    for attempt in range(max_retries):
-        try:
-            close_old_connections()
-            conse.save()
-            return  # Éxito
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"[worker] Thread {thread_id} - ⚠ DB locked al guardar progreso (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.error(f"[worker] Thread {thread_id} - ✗ OperationalError al guardar progreso: {error_str}")
-                break
-        except Exception as e:
-            logging.error(f"[worker] Thread {thread_id} - ✗ Error al guardar progreso: {str(e)}")
-            break
-    
-    logging.warning(f"[worker] Thread {thread_id} - ⚠ No se pudo guardar progreso después de {max_retries} intentos")
-
-
 def process_save(phone, oper, user, file, ip):
-    """
-    Guarda un número de teléfono en la base de datos con manejo de errores de bloqueo.
-    Incluye retry con backoff exponencial para manejar "database is locked".
-    """
-    max_retries = 5
-    base_delay = 0.1  # 100ms base delay
     
-    for attempt in range(max_retries):
+    cont = 0
+    while True:
         try:
-            # Cerrar conexiones viejas antes de operaciones DB en threads
-            close_old_connections()
-            
             Movil.objects.create(
                 file = file,
                 number = phone,
@@ -432,61 +345,27 @@ def process_save(phone, oper, user, file, ip):
                 user = user,
                 ip = ip
             )
-            logging.debug(f"[process_save] ✓ Guardado: {phone} | Operador: {oper} | Intento: {attempt + 1}")
-            return  # Éxito, salir
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                # Calcular delay exponencial: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"[process_save] ⚠ Database locked para {phone} (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.error(f"[process_save] ✗ OperationalError para {phone}: {error_str}")
-                if attempt >= max_retries - 1:
-                    return  # No reintentar si no es "locked"
+            break
         except Exception as e:
-            error_str = str(e)
-            logging.error(f"[process_save] ✗ Error DB para {phone}: {error_str}")
-            # Para otros errores, solo reintentar si es el primer intento
-            if attempt >= 1:
-                break
-    
-    logging.error(f"[process_save] ✗ FALLO después de {max_retries} intentos: {phone} | Operador: {oper}")
+            logging.info("Error DB: "+str(e))
+        if cont >= 3:
+            break
+        cont += 1
 
 def register_block(ip, user, proxy):
-    """
-    Registra un bloqueo de IP con manejo de errores de DB bloqueada.
-    """
-    max_retries = 3
-    base_delay = 0.1
-    
-    for attempt in range(max_retries):
-        try:
-            close_old_connections()
-            bip = BlockIp.objects.filter(ip_block=ip).first()
-            if not bip:
-                bip = BlockIp.objects.create(
-                    ip_block = ip,
-                    proxy_ip = proxy,
-                    user = user
-                )
-            else:
-                bip.reintent += 1
-                bip.save()
-            return  # Éxito
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"[register_block] ⚠ DB locked (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.error(f"[register_block] ✗ OperationalError: {error_str}")
-                break
-        except Exception as e:
-            logging.error(f"[register_block] ✗ Error DB: {str(e)}")
-            break
+    try:
+        bip = BlockIp.objects.filter(ip_block=ip).first()
+        if not bip:
+            bip = BlockIp.objects.create(
+                ip_block = ip,
+                proxy_ip = proxy,
+                user = user
+            )
+        else:
+            bip.reintent += 1
+            bip.save()
+    except Exception as e:
+        logging.info("Error DB: "+str(e))
 
 
 # Extraemos y guardamos a la base de datos.
@@ -545,7 +424,7 @@ def process_block(seg, phones, user, data, conse):
         if pg_operator != None:
             process_save(phone, pg_operator if pg_operator != None else "No existe", user, data["file"], "postgres")
             conse.progres += 1
-            _save_consecutive_with_retry(conse, "process_block", max_retries=3)
+            conse.save()
         else:
             segment = seg.getter(data)
             if segment["state"]:
@@ -569,19 +448,9 @@ def process_block(seg, phones, user, data, conse):
             else:
                 break
 
-    # Esperar a que todas las tareas en este bloque se completen (con timeout para evitar bloqueos)
-    TASK_TIMEOUT = 300  # 5 minutos máximo por tarea
+    # Esperar a que todas las tareas en este bloque se completen
     for task_name in tasks:
-        event = QUEUE_USER[user.username]["task_events"].get(task_name)
-        if event:
-            # Esperar con timeout para evitar bloqueos indefinidos
-            event_waited = event.wait(timeout=TASK_TIMEOUT)
-            if not event_waited:
-                logging.warning(f"[process_block] ⚠ TIMEOUT: Tarea {task_name} excedió {TASK_TIMEOUT}s - Continuando con siguiente tarea")
-                # Marcar el evento como señalizado para evitar bloqueos futuros
-                event.set()
-        else:
-            logging.warning(f"[process_block] ⚠ Evento no encontrado para tarea: {task_name}")
+        QUEUE_USER[user.username]["task_events"][task_name].wait()
 
 
 def split_into_chunks(data_list, chunk_size):
@@ -807,91 +676,40 @@ def filter_data(request):
 
 @api_view(["POST"])
 def phone_consult(request):
-    """
-    Endpoint para consultar un número telefónico individual.
-    Retorna estructura compatible con el frontend: {"data": [status_code, data_or_error]}
-    """
-    result = {"data": [500, "Error interno"]}
+    data = request.data
+    print(data)
+    print("SAM filter_data")
+    user = User.objects.filter(username=data["user"]).first()
+    if user is None:
+        user = User.objects.create(username=data["user"])
     
-    try:
-        data = request.data
-        logging.info(f"[phone_consult] Request data: {data}")
-        
-        if "user" not in data or "phone" not in data:
-            result["data"] = [400, "Faltan parámetros: user y phone son requeridos"]
-            logging.warning(f"[phone_consult] Faltan parámetros: {data}")
-            return Response(result, status=400)
-        
-        user = User.objects.filter(username=data["user"]).first()
-        if user is None:
-            user = User.objects.create(username=data["user"])
-        
-        digiPhone = DigiPhone(user, None)
-        
-        if digiPhone._len_proxy == 0:
-            result["data"] = [400, "No hay proxies disponibles para este usuario"]
-            logging.warning(f"[phone_consult] No hay proxies para usuario: {data['user']}")
-            return Response(result, status=400)
-        
-        logging.info(f"[phone_consult] Consultando teléfono: {data['phone']} para usuario: {data['user']}")
-        
-        # get_access con get_cart=False porque solo necesitamos consultar el operador
-        # No necesitamos preorder ni cart para get_phone_number()
-        access_success = digiPhone.get_access("", get_cart=False)
-        if not access_success:
-            result["data"] = [500, "Error obteniendo acceso (cookies)"]
-            logging.error(f"[phone_consult] Error obteniendo acceso")
-            return Response(result, status=500)
-        
-        data_phone = digiPhone.get_phone_number(phone=data["phone"])
-        
-        # Formatear respuesta en el formato esperado: [status_code, operator_object]
-        if isinstance(data_phone, tuple):
-            status, result_data = data_phone
-            if status == 200:
-                # Respuesta exitosa - retornar el objeto completo del operador
-                if isinstance(result_data, dict):
-                    result["data"] = [200, result_data]
-                    logging.info(f"[phone_consult] Operador encontrado: {result_data.get('name', 'N/A')} (ID: {result_data.get('operatorId', 'N/A')})")
+    digiPhone = DigiPhone(user, None)
+    data_phone = {"proxy_len": digiPhone._len_proxy}
+    if digiPhone._len_proxy > 0:
+        try:
+            logging.info(f"S.A.M. phone_consult for phone: {data['phone']}") 
+            # get_access ahora usa cookies, el parámetro token se mantiene por compatibilidad pero ya no se usa
+            digiPhone.get_access("")
+            data_phone = digiPhone.get_phone_number(phone=data["phone"])
+            
+            # Formatear respuesta para que sea consistente
+            if isinstance(data_phone, tuple):
+                status, result = data_phone
+                if status == 200:
+                    data_phone = {"status": status, "operator": result}
+                elif status == 404:
+                    # 404 con "Operator not found" = número de Digi
+                    if isinstance(result, dict) and result.get("message") == "Operator not found":
+                        data_phone = {"status": status, "operator": "DIGI SPAIN TELECOM, S.L.", "message": "Operator not found"}
+                    elif isinstance(result, str) and "Operator not found" in result:
+                        data_phone = {"status": status, "operator": "DIGI SPAIN TELECOM, S.L.", "message": "Operator not found"}
+                    else:
+                        data_phone = {"status": status, "error": result if isinstance(result, str) else str(result)}
                 else:
-                    result["data"] = [200, {"name": "Desconocido", "tradeName": "Desconocido"}]
-                    logging.warning(f"[phone_consult] Formato inesperado en respuesta 200: {result_data}")
-            elif status == 404:
-                # 404 con "Operator not found" = número de Digi
-                if isinstance(result_data, dict) and result_data.get("message") == "Operator not found":
-                    # Retornar como exitoso con el objeto del operador Digi
-                    result["data"] = [200, {
-                        "name": "DIGI SPAIN TELECOM, S.L.",
-                        "tradeName": "DIGI SPAIN TELECOM, S.L.",
-                        "operatorId": None
-                    }]
-                    logging.info(f"[phone_consult] Operador: DIGI SPAIN TELECOM, S.L. (Operator not found - Digi)")
-                elif isinstance(result_data, str) and "Operator not found" in result_data:
-                    # Retornar como exitoso con el objeto del operador Digi
-                    result["data"] = [200, {
-                        "name": "DIGI SPAIN TELECOM, S.L.",
-                        "tradeName": "DIGI SPAIN TELECOM, S.L.",
-                        "operatorId": None
-                    }]
-                    logging.info(f"[phone_consult] Operador: DIGI SPAIN TELECOM, S.L. (Operator not found - Digi)")
-                else:
-                    # Otro tipo de 404
-                    error_msg = result_data if isinstance(result_data, str) else str(result_data)
-                    result["data"] = [404, error_msg]
-                    logging.warning(f"[phone_consult] Error 404: {error_msg}")
-            else:
-                # Otros errores
-                error_msg = result_data if isinstance(result_data, str) else str(result_data)
-                result["data"] = [status, error_msg]
-                logging.warning(f"[phone_consult] Error {status}: {error_msg}")
-        else:
-            # Formato inesperado
-            result["data"] = [500, f"Formato de respuesta inesperado: {str(data_phone)}"]
-            logging.error(f"[phone_consult] Formato inesperado: {type(data_phone)} - {data_phone}")
-        
-    except Exception as e:
-        logging.exception(f"[phone_consult] Error inesperado: {e}")
-        result["data"] = [500, str(e)]
-    
-    logging.info(f"[phone_consult] Respuesta final: data[0]={result['data'][0]}")
-    return Response(result)
+                    data_phone = {"status": status, "error": result if isinstance(result, str) else str(result)}
+        except Exception as e1:
+            ip = "Pending"
+            logging.info(f"[-] Thread:Consulta individual - IP: {ip} - {digiPhone._proxy.password if digiPhone._proxy else ''} - {user.username} - Error1 83: "+str(e1))
+            data_phone = {"status": 500, "error": str(e1)}
+
+    return Response({"data": data_phone})

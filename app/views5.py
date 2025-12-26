@@ -28,8 +28,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.keys import Keys  # Importar Keys para presionar Enter
 from selenium.common.exceptions import TimeoutException
 import os
-from django.db import close_old_connections, transaction
-from django.db.utils import OperationalError
+from django.db import close_old_connections
 
 def borrar_movil_por_lotes(user, batch_size=1000):
     while True:
@@ -135,38 +134,28 @@ _logging = logging.basicConfig(filename="logger.log", level=logging.INFO)
 
 
 def check_scraping_in_db(number):
-    """
-    Verifica si un número ya existe en la base de datos (últimos 30 días).
-    Incluye manejo de errores de DB bloqueada.
-    """
+    # Definimos el umbral de 30 días
     thirty_days_ago = timezone.now() - timedelta(days=30)
-    max_retries = 3
-    base_delay = 0.05
-    
-    for attempt in range(max_retries):
+    # Buscamos el número en la base de datos donde ip='Pending' y fecha_hora < 30 días
+    cont = 0
+    while True:
         try:
-            close_old_connections()
             result = Movil.objects.filter(
                 number=number,
                 ip='Pending',
                 fecha_hora__gte=thirty_days_ago
             ).order_by('-fecha_hora').first()
-            return result.operator if result else None
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                delay = base_delay * (2 ** attempt)
-                logging.debug(f"[check_scraping_in_db] ⚠ DB locked para {number} (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.warning(f"[check_scraping_in_db] ✗ OperationalError para {number}: {error_str}")
-                return None
+            break
         except Exception as e:
-            logging.warning(f"[check_scraping_in_db] ✗ Error DB para {number}: {str(e)}")
-            if attempt >= max_retries - 1:
-                return None
-    
-    return None
+            result = None
+            logging.info(f"Error Check DB: {e}")
+        if cont >= 3:
+            break
+        cont += 1
+    # Buscamos el número en la base de datos
+    #result = Movil.objects.filter(number=number).first()
+    # Retornamos solo el número si existe, o None si no se encuentra
+    return result.operator if result else None
 
 
 QUEUE_USER = {}
@@ -179,9 +168,6 @@ QUEUE_USER = {}
 def worker(q, events, _thread, user, reprocess):
     digiPhone = DigiPhone(user, reprocess)
     if digiPhone._len_proxy > 0:
-        # Cerrar conexiones viejas al inicio del worker (importante para threads)
-        close_old_connections()
-        
         # Obtener acceso (cookies) al inicio para tenerlas listas
         try:
             logging.info(f"[worker] Thread {_thread} - Obteniendo acceso inicial (cookies)...")
@@ -230,14 +216,6 @@ def worker(q, events, _thread, user, reprocess):
                         "Max retries exceeded", "Connection closed", "EOF"
                     ])
                     
-                    # Detectar errores de conexión (RemoteDisconnected, ConnectionError, etc.)
-                    error_type = type(e1).__name__
-                    is_connection_error = any(conn_keyword in error_str or conn_keyword in error_type for conn_keyword in [
-                        "RemoteDisconnected", "Connection aborted", "ConnectionError",
-                        "ProtocolError", "Remote end closed connection", "Connection reset",
-                        "Broken pipe", "Connection refused"
-                    ])
-                    
                     if is_ssl_error:
                         ssl_error_count += 1
                         logging.warning(f"[worker] Thread {_thread} - ⚠ Error SSL #{ssl_error_count} para {task['phone']}: {error_str[:200]}")
@@ -247,19 +225,10 @@ def worker(q, events, _thread, user, reprocess):
                             logging.warning(f"[worker] Thread {_thread} - 🔄 Cambiando proxy después de {ssl_error_count} errores SSL consecutivos")
                             digiPhone.change_position()
                             ssl_error_count = 0  # Resetear contador después de cambiar proxy
-                            sleep(0.5)
-                    elif is_connection_error:
-                        ssl_error_count += 1  # Usar el mismo contador para ambos tipos de errores
-                        logging.warning(f"[worker] Thread {_thread} - ⚠ Error de conexión #{ssl_error_count} para {task['phone']}: {error_type} - {error_str[:200]}")
-                        
-                        # Cambiar proxy más rápido si hay múltiples errores de conexión
-                        if ssl_error_count >= max_ssl_errors:
-                            logging.warning(f"[worker] Thread {_thread} - 🔄 Cambiando proxy después de {ssl_error_count} errores de conexión consecutivos")
-                            digiPhone.change_position()
-                            ssl_error_count = 0
+                            # Pequeña pausa después de cambiar proxy
                             sleep(0.5)
                     else:
-                        logging.info(f"[worker] Thread {_thread} - Error desconocido: {error_type} - {error_str[:200]}")
+                        logging.info(f"[worker] Thread {_thread} - Error no-SSL: {error_str[:200]}")
                     
                     logging.info(f"[worker] Thread {_thread} - IP: {ip} | Proxy: {digiPhone._proxy.password if digiPhone._proxy else 'N/A'} | Usuario: {task['user'].username} | Error: {error_str[:150]}")
                     data_phone = (401, {"message": f"Error connect {error_str[:100]}"})
@@ -319,11 +288,8 @@ def worker(q, events, _thread, user, reprocess):
                 ip = "Pending"
                 logging.info(f"[worker] Thread {_thread} - ✓ ÉXITO: Teléfono {task['phone']} | Operador: {operator} | Tiempo: {task_elapsed:.2f}s | Usuario: {task['user']} | Archivo: {task['data']['file']}")
                 threading.Thread(target=process_save, args=(task["phone"], operator if operator != None else "No existe", task["user"], task["data"]["file"], ip)).start()
-                
-                # Actualizar progreso con manejo de errores de DB
                 task["conse"].progres += 1
-                _save_consecutive_with_retry(task["conse"], _thread, max_retries=3)
-                
+                task["conse"].save()
                 # Cambiar posición del proxy después de éxito
                 digiPhone.change_position()
             else:
@@ -385,46 +351,11 @@ class Segment:
                 result = True
         return result
 
-def _save_consecutive_with_retry(conse, thread_id, max_retries=3):
-    """
-    Guarda el objeto Consecutive con retry para manejar errores de DB bloqueada.
-    """
-    base_delay = 0.05  # 50ms base delay
-    
-    for attempt in range(max_retries):
-        try:
-            close_old_connections()
-            conse.save()
-            return  # Éxito
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"[worker] Thread {thread_id} - ⚠ DB locked al guardar progreso (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.error(f"[worker] Thread {thread_id} - ✗ OperationalError al guardar progreso: {error_str}")
-                break
-        except Exception as e:
-            logging.error(f"[worker] Thread {thread_id} - ✗ Error al guardar progreso: {str(e)}")
-            break
-    
-    logging.warning(f"[worker] Thread {thread_id} - ⚠ No se pudo guardar progreso después de {max_retries} intentos")
-
-
 def process_save(phone, oper, user, file, ip):
-    """
-    Guarda un número de teléfono en la base de datos con manejo de errores de bloqueo.
-    Incluye retry con backoff exponencial para manejar "database is locked".
-    """
-    max_retries = 5
-    base_delay = 0.1  # 100ms base delay
     
-    for attempt in range(max_retries):
+    cont = 0
+    while True:
         try:
-            # Cerrar conexiones viejas antes de operaciones DB en threads
-            close_old_connections()
-            
             Movil.objects.create(
                 file = file,
                 number = phone,
@@ -432,61 +363,27 @@ def process_save(phone, oper, user, file, ip):
                 user = user,
                 ip = ip
             )
-            logging.debug(f"[process_save] ✓ Guardado: {phone} | Operador: {oper} | Intento: {attempt + 1}")
-            return  # Éxito, salir
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                # Calcular delay exponencial: 0.1s, 0.2s, 0.4s, 0.8s, 1.6s
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"[process_save] ⚠ Database locked para {phone} (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.error(f"[process_save] ✗ OperationalError para {phone}: {error_str}")
-                if attempt >= max_retries - 1:
-                    return  # No reintentar si no es "locked"
+            break
         except Exception as e:
-            error_str = str(e)
-            logging.error(f"[process_save] ✗ Error DB para {phone}: {error_str}")
-            # Para otros errores, solo reintentar si es el primer intento
-            if attempt >= 1:
-                break
-    
-    logging.error(f"[process_save] ✗ FALLO después de {max_retries} intentos: {phone} | Operador: {oper}")
+            logging.info("Error DB: "+str(e))
+        if cont >= 3:
+            break
+        cont += 1
 
 def register_block(ip, user, proxy):
-    """
-    Registra un bloqueo de IP con manejo de errores de DB bloqueada.
-    """
-    max_retries = 3
-    base_delay = 0.1
-    
-    for attempt in range(max_retries):
-        try:
-            close_old_connections()
-            bip = BlockIp.objects.filter(ip_block=ip).first()
-            if not bip:
-                bip = BlockIp.objects.create(
-                    ip_block = ip,
-                    proxy_ip = proxy,
-                    user = user
-                )
-            else:
-                bip.reintent += 1
-                bip.save()
-            return  # Éxito
-        except OperationalError as e:
-            error_str = str(e)
-            if "database is locked" in error_str.lower() or "locked" in error_str.lower():
-                delay = base_delay * (2 ** attempt)
-                logging.warning(f"[register_block] ⚠ DB locked (intento {attempt + 1}/{max_retries}) - Esperando {delay:.2f}s")
-                sleep(delay)
-            else:
-                logging.error(f"[register_block] ✗ OperationalError: {error_str}")
-                break
-        except Exception as e:
-            logging.error(f"[register_block] ✗ Error DB: {str(e)}")
-            break
+    try:
+        bip = BlockIp.objects.filter(ip_block=ip).first()
+        if not bip:
+            bip = BlockIp.objects.create(
+                ip_block = ip,
+                proxy_ip = proxy,
+                user = user
+            )
+        else:
+            bip.reintent += 1
+            bip.save()
+    except Exception as e:
+        logging.info("Error DB: "+str(e))
 
 
 # Extraemos y guardamos a la base de datos.
@@ -545,7 +442,7 @@ def process_block(seg, phones, user, data, conse):
         if pg_operator != None:
             process_save(phone, pg_operator if pg_operator != None else "No existe", user, data["file"], "postgres")
             conse.progres += 1
-            _save_consecutive_with_retry(conse, "process_block", max_retries=3)
+            conse.save()
         else:
             segment = seg.getter(data)
             if segment["state"]:
