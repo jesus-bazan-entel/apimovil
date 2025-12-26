@@ -170,6 +170,7 @@ def check_scraping_in_db(number):
 
 
 QUEUE_USER = {}
+QUEUE_USER_LOCK = threading.Lock()  # Lock para proteger acceso concurrente a QUEUE_USER
 
 #for f in Consecutive.objects.all():
 #    f.active = False
@@ -337,21 +338,26 @@ def worker(q, events, _thread, user, reprocess):
             else:
                 logging.warning(f"[worker] Thread {_thread} - ⚠ Evento no encontrado para tarea: {task['phone']} (name_task: {task.get('name_task', 'N/A')})")
     else:
-        del QUEUE_USER[user.username]
+        # Thread-safe: usar pop() en lugar de del para evitar KeyError si múltiples threads
+        # intentan eliminar la misma clave simultáneamente
+        with QUEUE_USER_LOCK:
+            QUEUE_USER.pop(user.username, None)
         logging.info(f"[-] Porfavor asigne proxys - User: {user.username} - Cantidad de proxys actual: {digiPhone._len_proxy}")
 
 #-------------------------------------------------------------------------
 def addUserWithQueue(user, reprocess):
-    if user.username not in list(QUEUE_USER.keys()):
-        QUEUE_USER[user.username] = {
-            "task_queue": queue.Queue(),# Creamos una cola
-            "threads": [],# Creamos una lista para mantener los hilos
-            "task_events": {}
-        }
-        for i in range(4):
-            thread = threading.Thread(target=worker, args=(QUEUE_USER[user.username]["task_queue"],QUEUE_USER[user.username]["task_events"], i, user, reprocess))
-            thread.start()
-            QUEUE_USER[user.username]["threads"].append(thread)
+    # Thread-safe: proteger acceso a QUEUE_USER con lock
+    with QUEUE_USER_LOCK:
+        if user.username not in QUEUE_USER:
+            QUEUE_USER[user.username] = {
+                "task_queue": queue.Queue(),# Creamos una cola
+                "threads": [],# Creamos una lista para mantener los hilos
+                "task_events": {}
+            }
+            for i in range(4):
+                thread = threading.Thread(target=worker, args=(QUEUE_USER[user.username]["task_queue"],QUEUE_USER[user.username]["task_events"], i, user, reprocess))
+                thread.start()
+                QUEUE_USER[user.username]["threads"].append(thread)
 
 #--------------------------------------------------------------------------
 
