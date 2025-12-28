@@ -5,7 +5,7 @@ from django.utils import timezone
 
 class Consecutive(models.Model):
     active = models.BooleanField(default=True)
-    finish = models.BooleanField(default=False)
+    finish = models.DateTimeField(null=True, blank=True)
     file = models.CharField(max_length=150, null=True, blank=True)
     total = models.IntegerField(default=0)
     progres = models.IntegerField(default=0)
@@ -15,6 +15,40 @@ class Consecutive(models.Model):
 
     def __str__(self) -> str:
         return str(self.file)+" | "+str(self.user)
+
+    @property
+    def status(self):
+        """Retorna el estado real del proceso"""
+        if self.progres >= self.total:
+            return 'completed'
+        elif self.active:
+            return 'processing'
+        elif self.progres > 0:
+            return 'paused'
+        else:
+            return 'pending'
+    
+    @property
+    def status_display(self):
+        """Retorna el texto para mostrar en el frontend"""
+        status_map = {
+            'completed': 'Completado',
+            'processing': 'Procesando',
+            'paused': 'Pausado',
+            'pending': 'Pendiente'
+        }
+        return status_map.get(self.status, 'Desconocido')
+    
+    @property
+    def progress_percentage(self):
+        """Retorna el porcentaje de progreso"""
+        if self.total == 0:
+            return 0
+        return round((self.progres / self.total) * 100, 2)
+    
+    class Meta:
+        db_table = 'app_consecutive'
+
 
 class Movil(models.Model):
     file = models.CharField(max_length=100)

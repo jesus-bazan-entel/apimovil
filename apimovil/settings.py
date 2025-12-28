@@ -138,32 +138,35 @@ CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'  # Redis también como backen
 # Database
 # https://docs.djangoproject.com/en/3.2/ref/settings/#databases
 
-#state = False
-#if state:
-#    # Postgresql
-#    DATABASES = {
-#        'default': {
-#            'ENGINE': 'django.db.backends.postgresql_psycopg2',
-#            'NAME': 'postgres',
-#            'USER': 'postgres',
-#            'PASSWORD': 'admin',
-#            'HOST': '0.tcp.in.ngrok.io',
-#            'PORT': '16681',
-#        }
-#    }
-#else:
-#    DATABASES = {
-#        'default': {
-#            'ENGINE': 'django.db.backends.sqlite3',
-#            'NAME': BASE_DIR / 'db.sqlite3',
-#        }
-#    }
+# PostgreSQL Configuration
+# Usa variables de entorno para mayor seguridad
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.environ.get('DB_NAME', 'db_apimovil'),
+        'USER': os.environ.get('DB_USER', 'admin'),
+        'PASSWORD': os.environ.get('DB_PASSWORD', 'p0lDhDVc5SKo'),
+        'HOST': os.environ.get('DB_HOST', 'localhost'),
+        'PORT': os.environ.get('DB_PORT', '5432'),
+        'CONN_MAX_AGE': 0,
+        'OPTIONS': {
+            'connect_timeout': 10,
+            'keepalives': 1,
+            'keepalives_idle': 30,
+            'keepalives_interval': 10,
+            'keepalives_count': 5,
+        },
     }
 }
+
+# Configuración SQLite para desarrollo local (comentado)
+# Descomenta esto si necesitas volver a SQLite temporalmente
+# DATABASES = {
+#     'default': {
+#         'ENGINE': 'django.db.backends.sqlite3',
+#         'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
+#     }
+# }
 
 # Password validation
 # https://docs.djangoproject.com/en/3.2/ref/settings/#auth-password-validators
