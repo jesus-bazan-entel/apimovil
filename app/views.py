@@ -125,9 +125,9 @@ def guardar_movil_json():
 #            f.active = False
 #            f.save()
 
-for f in Consecutive.objects.all():
-    f.active = False
-    f.save()
+#for f in Consecutive.objects.all():
+#    f.active = False
+#    f.save()
 
 # Create your views here.
 
@@ -495,51 +495,68 @@ def register_block(ip, user, proxy):
             break
 
 
-# Extraemos y guardamos a la base de datos.
 def active_process(data):
+    from django.utils import timezone
+    from datetime import timedelta
+    
     user = User.objects.filter(username=data["user"]).first()
     if user is None:
         user = User.objects.create(username=data["user"])
-
+    
     seg = Segment()
     seg.change(data, True)
-    conse = Consecutive.objects.filter(file=data["file"]).last()
-    if not conse:
-        conse = Consecutive.objects.create(
-            file = data["file"],
-            total = len(data["number"]),
-            user = user
-        )
-    else:
-        conse.active = True
-        conse.save()
-
-    # Get phone
-    segment = seg.getter(data)
-
-    addUserWithQueue(user, data["reprocess"])
-    sleep(10)
-
-    #theads_process = []
-    if user.username in list(QUEUE_USER.keys()):
-
-        # Dividimos la lista de números en bloques de 10
-        chunks = list(split_into_chunks(data["number"], 10))
-
-        # Usamos ThreadPoolExecutor para procesar los bloques de números en paralelo
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            # Enviar cada bloque a process_block para que se ejecute en paralelo
-            futures = [executor.submit(process_block, seg, chunk, user, data, conse) for chunk in chunks]
+    
+    # Limpiar procesos colgados automáticamente (>12 horas activos)
+    old_threshold = timezone.now() - timedelta(hours=12)
+    old_processes = Consecutive.objects.filter(
+        user=user,
+        active=True,
+        created__lt=old_threshold
+    )
+    if old_processes.exists():
+        count = old_processes.count()
+        logging.warning(f"Limpiando {count} procesos colgados para usuario {user.username}")
+        for old in old_processes:
+            logging.warning(f"  - Proceso colgado: {old.file} (ID: {old.id}, creado: {old.created})")
+        old_processes.update(active=False)
+    
+    # CAMBIADO: Siempre crear un nuevo registro para cada archivo
+    conse = Consecutive.objects.create(
+        file=data["file"],
+        total=len(data["number"]),
+        user=user,
+        active=True,
+        finish=None
+    )
+    
+    try:
+        segment = seg.getter(data)
+        addUserWithQueue(user, data["reprocess"])
+        sleep(10)
         
-            # Esperamos a que todas las tareas terminen
-            for future in concurrent.futures.as_completed(futures):
-                future.result()
-
-    if segment["state"]:
-        seg.change(data, False)
-    conse.active = False
-    conse.save()
-    logging.info("Proceso finalizado: "+str(data["file"]))
+        if user.username in list(QUEUE_USER.keys()):
+            chunks = list(split_into_chunks(data["number"], 10))
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+                futures = [executor.submit(process_block, seg, chunk, user, data, conse) for chunk in chunks]
+                
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+    
+    except Exception as e:
+        logging.error(f"Error en active_process para {data['file']}: {str(e)}")
+    
+    finally:
+        if segment["state"]:
+            seg.change(data, False)
+        
+        conse.active = False
+        
+        if conse.progres >= conse.total:
+            conse.finish = timezone.now()
+        
+        conse.save()
+        logging.info(f"Proceso finalizado: {data['file']} ({conse.progres}/{conse.total})")
 
 
 def process_block(seg, phones, user, data, conse):
@@ -788,6 +805,7 @@ def consult(request):
         result["data"] = {"total": total, "proces": c.progres, "subido": c.total, "list":data}
     return Response(result)
 
+
 @api_view(["POST"])
 def filter_data(request):
     data = request.data
@@ -796,10 +814,29 @@ def filter_data(request):
     user = User.objects.filter(username=data["user"]).first()
     if user is None:
         user = User.objects.create(username=data["user"])
+    
     c = Consecutive.objects.filter(user=user).order_by("-id")
-    data = []
+    response_data = []
+    
     for i in c:
-        data.append({
+        # Calcular estado basado en progreso y active
+        if i.progres >= i.total:
+            status = 'completed'
+            status_display = 'Completado'
+        elif i.active:
+            status = 'processing'
+            status_display = 'Procesando'
+        elif i.progres > 0:
+            status = 'paused'
+            status_display = 'Pausado'
+        else:
+            status = 'pending'
+            status_display = 'Pendiente'
+        
+        # Calcular porcentaje de progreso
+        progress_percentage = round((i.progres / i.total * 100), 2) if i.total > 0 else 0
+        
+        response_data.append({
             "id": i.pk,
             "file": i.file,
             "total": i.total,
@@ -807,9 +844,15 @@ def filter_data(request):
             "conse": i.num,
             "created": i.created,
             "finish": i.finish,
-            "active": i.active
+            "active": i.active,
+            # NUEVOS CAMPOS - El frontend puede usarlos cuando esté listo
+            "status": status,
+            "status_display": status_display,
+            "progress_percentage": progress_percentage
         })
-    return Response({"data": data})
+    
+    return Response({"data": response_data})
+
 
 @api_view(["POST"])
 def phone_consult(request):
