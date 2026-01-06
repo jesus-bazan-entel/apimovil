@@ -1,0 +1,414 @@
+"""
+🚀 Tareas Celery OPTIMIZADAS con caché Redis.
+"""
+from celery import shared_task
+from django.db import transaction, connection
+from .models import Movil, Consecutive
+from django.core.cache import cache
+import logging
+from time import sleep
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=5)
+def process_save_task(self, phone, operator, user_id, file, ip):
+    """
+    Tarea Celery para guardar un número de teléfono en la base de datos.
+    Además actualiza el caché Redis si es un número nuevo.
+    """
+    try:
+        with transaction.atomic():
+            movil = Movil.objects.create(
+                file=file,
+                number=phone,
+                operator=operator,
+                user_id=user_id,
+                ip=ip
+            )
+        
+        # 🚀 Actualizar caché Redis con el nuevo número
+        if operator not in ['ERROR_SCRAPING', 'No existe', 'Desconocido'] and ip != 'cache':
+            try:
+                from .signals import add_to_phone_cache
+                add_to_phone_cache(phone, operator, file)
+                logger.debug(f"[process_save_task] Caché actualizado: {phone} → {operator}")
+            except Exception as e:
+                logger.warning(f"[process_save_task] Error actualizando caché: {e}")
+        
+        logger.info(f"[process_save_task] ✓ Guardado: {phone} | Operador: {operator} | Fuente: {ip}")
+        return {"status": "success", "phone": phone}
+
+    except Exception as e:
+        logger.error(f"[process_save_task] ✗ Error guardando {phone}: {e}")
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+
+    finally:
+        connection.close()
+
+
+@shared_task(bind=True, max_retries=3)
+def update_consecutive_task(self, consecutive_id, increment_progress=True):
+    """
+    Tarea Celery para actualizar el progreso de un Consecutive.
+    """
+    try:
+        with transaction.atomic():
+            consecutive = Consecutive.objects.select_for_update().get(id=consecutive_id)
+
+            if increment_progress:
+                consecutive.progres += 1
+
+            consecutive.save()
+
+        logger.debug(f"[update_consecutive_task] ✓ Consecutive {consecutive_id} actualizado")
+        return {"status": "success", "consecutive_id": consecutive_id}
+
+    except Consecutive.DoesNotExist:
+        logger.error(f"[update_consecutive_task] ✗ Consecutive {consecutive_id} no existe")
+        return {"status": "error", "message": "Consecutive not found"}
+
+    except Exception as e:
+        logger.error(f"[update_consecutive_task] ✗ Error actualizando {consecutive_id}: {e}")
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+
+    finally:
+        connection.close()
+
+
+@shared_task
+def cleanup_old_tasks():
+    """
+    Tarea periódica para limpiar tareas antiguas (ejecutar diariamente).
+    """
+    from datetime import timedelta
+    from django.utils import timezone
+
+    cutoff_date = timezone.now() - timedelta(days=30)
+    logger.info("[cleanup_old_tasks] Limpieza ejecutada")
+    return {"status": "success"}
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=10)
+def scrape_and_save_phone_task(self, phone_number, user_id, file_name, max_attempts=3):
+    """
+    🚀 OPTIMIZADO: Tarea Celery completa con caché Redis.
+    
+    Flujo:
+    1. Verifica caché Redis
+    2. Verifica BD PostgreSQL
+    3. Si no existe: hace scraping
+    4. Guarda en BD y actualiza caché
+    """
+    from .browser import DigiPhone
+    from django.contrib.auth.models import User
+
+    try:
+        # Obtener usuario
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            logger.error(f"[scrape_and_save_phone_task] Usuario {user_id} no existe")
+            return {"status": "error", "message": "User not found", "phone": phone_number}
+
+        # 🚀 PASO 1: Verificar en caché Redis + BD
+        from app.views import check_scraping_in_cache_and_db
+        operator, source = check_scraping_in_cache_and_db(phone_number)
+        
+        if operator:
+            logger.info(f"[scrape_and_save_phone_task] ✓ {phone_number} encontrado en {source} → {operator}")
+            
+            # Verificar si ya existe en BD para este archivo
+            if not Movil.objects.filter(file=file_name, number=phone_number).exists():
+                with transaction.atomic():
+                    Movil.objects.create(
+                        file=file_name,
+                        number=phone_number,
+                        operator=operator,
+                        user=user,
+                        ip=source  # 'cache' o 'database'
+                    )
+                logger.info(f"[scrape_and_save_phone_task] ✅ Guardado desde {source}: {phone_number} | {operator}")
+            else:
+                logger.info(f"[scrape_and_save_phone_task] ⚠ Ya existe: {phone_number} en {file_name}")
+            
+            return {
+                "status": "success",
+                "phone": phone_number,
+                "operator": operator,
+                "source": source,
+                "attempts": 0
+            }
+
+        # 🚀 PASO 2: No está en caché ni BD → Hacer scraping
+        logger.info(f"[scrape_and_save_phone_task] Iniciando scraping para {phone_number}")
+        
+        # Verificar si ya existe en DB (por si acaso)
+        if Movil.objects.filter(file=file_name, number=phone_number).exists():
+            logger.info(f"[scrape_and_save_phone_task] ⚠ Ya existe: {phone_number}")
+            return {"status": "skipped", "phone": phone_number, "reason": "duplicate"}
+
+        # Inicializar DigiPhone
+        digi_phone = DigiPhone(user=user, reprocess=False)
+
+        if not hasattr(digi_phone, 'cookies'):
+             digi_phone.cookies = None
+
+        # Intentar obtener operador
+        last_error = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"[scrape_and_save_phone_task] Intento {attempt}/{max_attempts} para {phone_number}")
+
+                # Obtener acceso si es necesario
+                if not digi_phone.cookies:
+                    if not digi_phone.get_access(get_cart=False):
+                        raise Exception("No se pudo obtener acceso")
+
+                # Consultar operador
+                result = digi_phone.get_phone_number(phone=phone_number)
+
+                if result[0] == 200:
+                    operator = result[1].get('name', 'Desconocido')
+                    logger.info(f"[scrape_and_save_phone_task] ✓ {phone_number} → {operator}")
+                    break
+                elif result[0] == 404:
+                    operator = "DIGI SPAIN TELECOM, S.L."
+                    logger.info(f"[scrape_and_save_phone_task] ✓ {phone_number} → {operator} (404)")
+                    break
+                else:
+                    last_error = f"Status {result[0]}"
+                    logger.warning(f"[scrape_and_save_phone_task] Intento {attempt} falló: {last_error}")
+
+                    if attempt < max_attempts:
+                        sleep(2 ** attempt)
+
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"[scrape_and_save_phone_task] Error intento {attempt}: {e}")
+
+                if attempt < max_attempts:
+                    sleep(2 ** attempt)
+
+        # Si no se obtuvo operador después de todos los intentos
+        if operator is None:
+            operator = "ERROR_SCRAPING"
+            logger.error(f"[scrape_and_save_phone_task] ✗ {phone_number} → ERROR_SCRAPING después de {max_attempts} intentos (último error: {last_error})")
+
+        # 🚀 PASO 3: Guardar en base de datos Y actualizar caché
+        with transaction.atomic():
+            Movil.objects.create(
+                file=file_name,
+                number=phone_number,
+                operator=operator,
+                user=user,
+                ip="scraping"
+            )
+        
+        # Actualizar caché solo si es un operador válido
+        if operator not in ['ERROR_SCRAPING', 'No existe', 'Desconocido']:
+            try:
+                from .signals import add_to_phone_cache
+                add_to_phone_cache(phone_number, operator, file_name)
+                logger.info(f"[scrape_and_save_phone_task] Caché actualizado: {phone_number} → {operator}")
+            except Exception as e:
+                logger.warning(f"[scrape_and_save_phone_task] Error actualizando caché: {e}")
+
+        logger.info(f"[scrape_and_save_phone_task] ✅ Guardado: {phone_number} | {operator}")
+
+        return {
+            "status": "success",
+            "phone": phone_number,
+            "operator": operator,
+            "attempts": attempt
+        }
+
+    except Exception as e:
+        logger.error(f"[scrape_and_save_phone_task] ✗ Error crítico para {phone_number}: {e}")
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+
+    finally:
+        connection.close()
+
+
+@shared_task(bind=True)
+def update_consecutive_progress_task(self, consecutive_id, increment=1):
+    """
+    Actualiza el progreso de un Consecutive de forma atómica.
+    Auto-finaliza cuando progres >= total.
+    """
+    try:
+        from django.utils import timezone
+
+        with transaction.atomic():
+            consecutive = Consecutive.objects.select_for_update().get(id=consecutive_id)
+            consecutive.progres += increment
+
+            # Auto-finalizar si completó el total
+            if consecutive.progres >= consecutive.total and consecutive.active:
+                consecutive.active = False
+                consecutive.finish = timezone.now()
+                logger.info(f"✅ [update_consecutive_progress] ARCHIVO COMPLETADO: {consecutive.file} ({consecutive.progres}/{consecutive.total})")
+
+            consecutive.save()
+
+        logger.debug(f"[update_consecutive_progress_task] Progreso: {consecutive.file} ({consecutive.progres}/{consecutive.total})")
+
+        return {
+            "status": "success",
+            "consecutive_id": consecutive_id,
+            "progres": consecutive.progres,
+            "total": consecutive.total,
+            "completed": consecutive.progres >= consecutive.total
+        }
+
+    except Consecutive.DoesNotExist:
+        logger.error(f"[update_consecutive_progress_task] Consecutive {consecutive_id} no existe")
+        return {"status": "error", "message": "Consecutive not found"}
+
+    except Exception as e:
+        logger.error(f"[update_consecutive_progress_task] Error: {e}")
+        raise self.retry(exc=e, countdown=5, max_retries=3)
+
+    finally:
+        connection.close()
+
+
+@shared_task(bind=True)
+def process_file_in_batches(self, consecutive_id, batch_size=200):
+    """
+    🚀 OPTIMIZADO: Procesa un archivo en lotes usando caché Redis.
+    
+    Ventajas con caché:
+    - 442K números en memoria (Redis)
+    - Consulta < 1ms por número en caché
+    - Solo hace scraping de números nuevos
+    """
+    try:
+        consecutive = Consecutive.objects.get(id=consecutive_id)
+
+        # Verificar si el archivo sigue activo
+        if not consecutive.active:
+            logger.info(f"[process_file_in_batches] Archivo {consecutive.file} ya no está activo")
+            return {"status": "cancelled", "consecutive_id": consecutive_id}
+
+        # Obtener números ya procesados (en memoria para evitar query N+1)
+        already_processed_numbers = set(
+            Movil.objects.filter(
+                file=consecutive.file,
+                user=consecutive.user
+            ).values_list('number', flat=True)
+        )
+
+        # Cargar todos los números del archivo
+        import pandas as pd
+        file_path = f"/opt/masterfilter/media/subido/{consecutive.file}"
+
+        # Leer archivo (ajustar según formato)
+        if consecutive.file.endswith('.xlsx'):
+            df = pd.read_excel(file_path)
+        elif consecutive.file.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        else:
+            logger.error(f"[process_file_in_batches] Formato no soportado: {consecutive.file}")
+            return {"status": "error", "message": "Unsupported format"}
+
+        # Obtener columna de números (ajustar nombre de columna)
+        phone_column = df.columns[0]
+        all_phones = df[phone_column].astype(str).str.strip().tolist()
+
+        # Filtrar números ya procesados
+        pending_phones = [p for p in all_phones if p not in already_processed_numbers]
+
+        # Procesar solo un lote
+        current_batch = pending_phones[:batch_size]
+
+        logger.info(f"[process_file_in_batches] Procesando lote de {len(current_batch)} números para {consecutive.file}")
+
+        # 🚀 ESTADÍSTICAS DE CACHÉ
+        cache_hits = 0
+        db_hits = 0
+        scraping_needed = 0
+
+        # Encolar tareas para este lote
+        for phone in current_batch:
+            # 🚀 Verificar en caché + BD con una sola llamada optimizada
+            from app.views import check_scraping_in_cache_and_db
+            operator, source = check_scraping_in_cache_and_db(phone)
+
+            if operator:
+                if source == 'cache':
+                    cache_hits += 1
+                elif source == 'database':
+                    db_hits += 1
+                
+                # Guardar desde caché/BD
+                process_save_task.delay(
+                    phone=phone,
+                    operator=operator,
+                    user_id=consecutive.user.id,
+                    file=consecutive.file,
+                    ip=source  # 'cache' o 'database'
+                )
+
+                # Incrementar progreso para números de caché/BD
+                update_consecutive_progress_task.delay(
+                    consecutive_id=consecutive.id,
+                    increment=1
+                )
+
+            else:
+                scraping_needed += 1
+                # Scraping vía Celery
+                scrape_and_save_phone_task.delay(
+                    phone_number=phone,
+                    user_id=consecutive.user.id,
+                    file_name=consecutive.file,
+                    max_attempts=3
+                )
+
+        # 📊 LOG DE ESTADÍSTICAS
+        total_batch = len(current_batch)
+        cache_hit_rate = (cache_hits / total_batch * 100) if total_batch > 0 else 0
+        logger.info(f"""
+        📊 ESTADÍSTICAS DEL LOTE ({consecutive.file}):
+        Total procesado: {total_batch}
+        └─ Caché Redis: {cache_hits} ({cache_hit_rate:.1f}%)
+        └─ Base de datos: {db_hits} ({db_hits/total_batch*100 if total_batch > 0 else 0:.1f}%)
+        └─ Requiere scraping: {scraping_needed} ({scraping_needed/total_batch*100 if total_batch > 0 else 0:.1f}%)
+        """)
+
+        # Si quedan más números pendientes, programar el siguiente lote
+        remaining = len(pending_phones) - batch_size
+        if remaining > 0:
+            logger.info(f"[process_file_in_batches] Quedan {remaining} números. Programando siguiente lote en 15s...")
+
+            # Programar siguiente lote con delay
+            process_file_in_batches.apply_async(
+                args=[consecutive_id, batch_size],
+                countdown=5
+            )
+        else:
+            logger.info(f"[process_file_in_batches] ✅ Archivo {consecutive.file} completamente encolado")
+
+        return {
+            "status": "success",
+            "consecutive_id": consecutive_id,
+            "batch_processed": len(current_batch),
+            "remaining": max(0, remaining),
+            "cache_hits": cache_hits,
+            "db_hits": db_hits,
+            "scraping_needed": scraping_needed
+        }
+
+    except Consecutive.DoesNotExist:
+        logger.error(f"[process_file_in_batches] Consecutive {consecutive_id} no existe")
+        return {"status": "error", "message": "Consecutive not found"}
+
+    except Exception as e:
+        logger.error(f"[process_file_in_batches] Error: {e}")
+        raise self.retry(exc=e, countdown=30, max_retries=3)
+
+    finally:
+        connection.close()

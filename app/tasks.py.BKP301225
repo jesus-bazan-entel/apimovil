@@ -1,0 +1,379 @@
+"""
+Tareas Celery para procesamiento asíncrono.
+"""
+from celery import shared_task
+from django.db import transaction, connection
+from .models import Movil, Consecutive
+import logging
+from time import sleep
+
+logger = logging.getLogger(__name__)
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=5)
+def process_save_task(self, phone, operator, user_id, file, ip):
+    """
+    Tarea Celery para guardar un número de teléfono en la base de datos.
+    
+    Args:
+        phone: Número de teléfono
+        operator: Operador móvil
+        user_id: ID del usuario
+        file: Nombre del archivo
+        ip: Dirección IP
+    """
+    try:
+        with transaction.atomic():
+            Movil.objects.create(
+                file=file,
+                number=phone,
+                operator=operator,
+                user_id=user_id,
+                ip=ip
+            )
+        logger.info(f"[process_save_task] ✓ Guardado: {phone} | Operador: {operator}")
+        return {"status": "success", "phone": phone}
+        
+    except Exception as e:
+        logger.error(f"[process_save_task] ✗ Error guardando {phone}: {e}")
+        # Retry automático con backoff exponencial
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+    
+    finally:
+        # Cerrar conexión DB al finalizar tarea
+        connection.close()
+
+
+@shared_task(bind=True, max_retries=3)
+def update_consecutive_task(self, consecutive_id, increment_progress=True):
+    """
+    Tarea Celery para actualizar el progreso de un Consecutive.
+    
+    Args:
+        consecutive_id: ID del objeto Consecutive
+        increment_progress: Si True, incrementa el progreso en 1
+    """
+    try:
+        with transaction.atomic():
+            consecutive = Consecutive.objects.select_for_update().get(id=consecutive_id)
+            
+            if increment_progress:
+                consecutive.progres += 1
+            
+            consecutive.save()
+        
+        logger.debug(f"[update_consecutive_task] ✓ Consecutive {consecutive_id} actualizado")
+        return {"status": "success", "consecutive_id": consecutive_id}
+        
+    except Consecutive.DoesNotExist:
+        logger.error(f"[update_consecutive_task] ✗ Consecutive {consecutive_id} no existe")
+        return {"status": "error", "message": "Consecutive not found"}
+        
+    except Exception as e:
+        logger.error(f"[update_consecutive_task] ✗ Error actualizando {consecutive_id}: {e}")
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+    
+    finally:
+        connection.close()
+
+
+@shared_task
+def cleanup_old_tasks():
+    """
+    Tarea periódica para limpiar tareas antiguas (ejecutar diariamente).
+    """
+    from datetime import timedelta
+    from django.utils import timezone
+    
+    # Ejemplo: limpiar registros antiguos
+    cutoff_date = timezone.now() - timedelta(days=30)
+    # Aquí puedes agregar lógica de limpieza
+    
+    logger.info("[cleanup_old_tasks] Limpieza ejecutada")
+    return {"status": "success"}
+
+
+@shared_task(bind=True, max_retries=3, default_retry_delay=10)
+def scrape_and_save_phone_task(self, phone_number, user_id, file_name, max_attempts=3):
+    """
+    Tarea Celery completa: consulta operador + guarda en DB.
+    
+    Args:
+        phone_number: Número de teléfono a consultar
+        user_id: ID del usuario que solicita
+        file_name: Nombre del archivo origen
+        max_attempts: Intentos máximos de scraping
+    
+    Returns:
+        dict: Resultado de la operación
+    """
+    from .browser import DigiPhone
+    from django.contrib.auth.models import User
+    
+    try:
+        # Obtener usuario
+        try:
+            user = User.objects.get(id=user_id)
+        except User.DoesNotExist:
+            logger.error(f"[scrape_and_save_phone_task] Usuario {user_id} no existe")
+            return {"status": "error", "message": "User not found", "phone": phone_number}
+        
+        # Verificar si ya existe en DB
+        if Movil.objects.filter(file=file_name, number=phone_number).exists():
+            logger.info(f"[scrape_and_save_phone_task] ⚠ Ya existe: {phone_number}")
+            return {"status": "skipped", "phone": phone_number, "reason": "duplicate"}
+        
+        # Inicializar DigiPhone
+        #digi_phone = DigiPhone(user_id=user_id)
+        digi_phone = DigiPhone(user=user, reprocess=False)
+        
+        if not hasattr(digi_phone, 'cookies'):
+             digi_phone.cookies = None
+
+        # Intentar obtener operador
+        operator = None
+        last_error = None
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"[scrape_and_save_phone_task] Intento {attempt}/{max_attempts} para {phone_number}")
+                
+                # Obtener acceso si es necesario
+                if not digi_phone.cookies:
+                    if not digi_phone.get_access(get_cart=False):
+                        raise Exception("No se pudo obtener acceso")
+                
+                # Consultar operador
+                result = digi_phone.get_phone_number(phone=phone_number)
+                
+                if result[0] == 200:
+                    operator = result[1].get('name', 'Desconocido')
+                    logger.info(f"[scrape_and_save_phone_task] ✓ {phone_number} → {operator}")
+                    break
+                elif result[0] == 404:
+                    operator = "DIGI SPAIN TELECOM, S.L."
+                    logger.info(f"[scrape_and_save_phone_task] ✓ {phone_number} → {operator} (404)")
+                    break
+                else:
+                    last_error = f"Status {result[0]}"
+                    logger.warning(f"[scrape_and_save_phone_task] Intento {attempt} falló: {last_error}")
+                    
+                    if attempt < max_attempts:
+                        sleep(2 ** attempt)  # Backoff: 2s, 4s, 8s
+                        
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"[scrape_and_save_phone_task] Error intento {attempt}: {e}")
+                
+                if attempt < max_attempts:
+                    sleep(2 ** attempt)
+        
+        # Si no se obtuvo operador después de todos los intentos
+        #if operator is None:
+        #    operator = "No existe"
+        #    logger.error(f"[scrape_and_save_phone_task] ✗ {phone_number} → Sin operador después de {max_attempts} intentos")
+        # Si no se obtuvo operador después de todos los intentos
+        if operator is None:
+            operator = "ERROR_SCRAPING"
+            logger.error(f"[scrape_and_save_phone_task] ✗ {phone_number} → ERROR_SCRAPING después de {max_attempts} intentos (último error: {last_error})")
+        
+        # Guardar en base de datos
+        with transaction.atomic():
+            Movil.objects.create(
+                file=file_name,
+                number=phone_number,
+                operator=operator,
+                user=user,
+                ip="Pending"
+            )
+        
+        logger.info(f"[scrape_and_save_phone_task] ✅ Guardado: {phone_number} | {operator}")
+        
+        return {
+            "status": "success",
+            "phone": phone_number,
+            "operator": operator,
+            "attempts": attempt
+        }
+        
+    except Exception as e:
+        logger.error(f"[scrape_and_save_phone_task] ✗ Error crítico para {phone_number}: {e}")
+        
+        # Retry con backoff exponencial
+        raise self.retry(exc=e, countdown=2 ** self.request.retries)
+    
+    finally:
+        # Cerrar conexión DB
+        connection.close()
+
+
+@shared_task(bind=True)
+def update_consecutive_progress_task(self, consecutive_id, increment=1):
+    """
+    Actualiza el progreso de un Consecutive de forma atómica.
+    Auto-finaliza cuando progres >= total.
+    
+    Args:
+        consecutive_id: ID del Consecutive
+        increment: Cantidad a incrementar (default: 1)
+    
+    Returns:
+        dict: Estado actualizado con flag de completado
+    """
+    try:
+        from django.utils import timezone
+        
+        with transaction.atomic():
+            consecutive = Consecutive.objects.select_for_update().get(id=consecutive_id)
+            consecutive.progres += increment
+            
+            # Auto-finalizar si completó el total
+            if consecutive.progres >= consecutive.total and consecutive.active:
+                consecutive.active = False
+                consecutive.finish = timezone.now()
+                logger.info(f"✅ [update_consecutive_progress] ARCHIVO COMPLETADO: {consecutive.file} ({consecutive.progres}/{consecutive.total})")
+            
+            consecutive.save()
+        
+        logger.debug(f"[update_consecutive_progress_task] Progreso: {consecutive.file} ({consecutive.progres}/{consecutive.total})")
+        
+        return {
+            "status": "success",
+            "consecutive_id": consecutive_id,
+            "progres": consecutive.progres,
+            "total": consecutive.total,
+            "completed": consecutive.progres >= consecutive.total
+        }
+        
+    except Consecutive.DoesNotExist:
+        logger.error(f"[update_consecutive_progress_task] Consecutive {consecutive_id} no existe")
+        return {"status": "error", "message": "Consecutive not found"}
+    
+    except Exception as e:
+        logger.error(f"[update_consecutive_progress_task] Error: {e}")
+        raise self.retry(exc=e, countdown=5, max_retries=3)
+    
+    finally:
+        connection.close()
+
+
+@shared_task(bind=True)
+def process_file_in_batches(self, consecutive_id, batch_size=100):
+    """
+    Procesa un archivo en lotes para evitar saturar la cola de Redis.
+    
+    Args:
+        consecutive_id: ID del Consecutive
+        batch_size: Cantidad de números a procesar por lote (default: 100)
+    """
+    try:
+        consecutive = Consecutive.objects.get(id=consecutive_id)
+        
+        # Verificar si el archivo sigue activo
+        if not consecutive.active:
+            logger.info(f"[process_file_in_batches] Archivo {consecutive.file} ya no está activo")
+            return {"status": "cancelled", "consecutive_id": consecutive_id}
+        
+        # Obtener números ya procesados (en memoria para evitar query N+1)
+        already_processed_numbers = set(
+            Movil.objects.filter(
+                file=consecutive.file,
+                user=consecutive.user
+            ).values_list('number', flat=True)
+        )
+        
+        # Cargar todos los números del archivo
+        import pandas as pd
+        file_path = f"/opt/masterfilter/media/subido/{consecutive.file}"
+        
+        # Leer archivo (ajustar según formato)
+        if consecutive.file.endswith('.xlsx'):
+            df = pd.read_excel(file_path)
+        elif consecutive.file.endswith('.csv'):
+            df = pd.read_csv(file_path)
+        else:
+            logger.error(f"[process_file_in_batches] Formato no soportado: {consecutive.file}")
+            return {"status": "error", "message": "Unsupported format"}
+        
+        # Obtener columna de números (ajustar nombre de columna)
+        phone_column = df.columns[0]  # Asume que la primera columna tiene los números
+        all_phones = df[phone_column].astype(str).str.strip().tolist()
+        
+        # Filtrar números ya procesados
+        pending_phones = [p for p in all_phones if p not in already_processed_numbers]
+        
+        # Procesar solo un lote
+        current_batch = pending_phones[:batch_size]
+        
+        logger.info(f"[process_file_in_batches] Procesando lote de {len(current_batch)} números para {consecutive.file}")
+        
+        # Encolar tareas para este lote
+        for phone in current_batch:
+            # Importar dentro de la función para evitar import circular
+            from app.views import check_scraping_in_db
+            # Verificar en caché PostgreSQL (últimos 30 días)
+            pg_operator = check_scraping_in_db(phone)
+
+            if pg_operator:
+                # Guardar desde caché
+                process_save_task.delay(
+                    phone=phone,
+                    operator=pg_operator,
+                    user_id=consecutive.user.id,
+                    file=consecutive.file,
+                    ip="cache"
+                )
+
+                # Incrementar progreso para números de caché
+                update_consecutive_progress_task.delay(
+                    consecutive_id=consecutive.id,
+                    increment=1
+                )
+
+            else:
+                # Scraping vía Celery
+                scrape_and_save_phone_task.delay(
+                    phone_number=phone,
+                    user_id=consecutive.user.id,
+                    file_name=consecutive.file,
+                    max_attempts=3
+                )
+            
+            # Actualizar progreso
+            #update_consecutive_progress_task.delay(
+            #    consecutive_id=consecutive.id,
+            #    increment=1
+            #)
+        
+        # Si quedan más números pendientes, programar el siguiente lote
+        remaining = len(pending_phones) - batch_size
+        if remaining > 0:
+            logger.info(f"[process_file_in_batches] Quedan {remaining} números. Programando siguiente lote en 10s...")
+            
+            # Programar siguiente lote con delay de 10 segundos
+            process_file_in_batches.apply_async(
+                args=[consecutive_id, batch_size],
+                countdown=20  # Esperar 10 segundos
+            )
+        else:
+            logger.info(f"[process_file_in_batches] ✅ Archivo {consecutive.file} completamente encolado")
+        
+        return {
+            "status": "success",
+            "consecutive_id": consecutive_id,
+            "batch_processed": len(current_batch),
+            "remaining": max(0, remaining)
+        }
+        
+    except Consecutive.DoesNotExist:
+        logger.error(f"[process_file_in_batches] Consecutive {consecutive_id} no existe")
+        return {"status": "error", "message": "Consecutive not found"}
+    
+    except Exception as e:
+        logger.error(f"[process_file_in_batches] Error: {e}")
+        raise self.retry(exc=e, countdown=30, max_retries=3)
+    
+    finally:
+        connection.close()
+
+

@@ -35,7 +35,7 @@ class DigiPhone:
         #else:
             #self.proxys = Proxy.objects.filter(user=user, username='84937b4537718abef992__cr.es').first()
         #    self.proxys = Proxy.objects.filter(user=user).first()
-        logging.info(f"proxys: {str(self.proxys)}")
+        #logging.info(f"proxys: {str(self.proxys)}")
         self.proxies = []
         
         # Circuit breaker: tracking de errores SSL y conexión por proxy
@@ -49,7 +49,7 @@ class DigiPhone:
             p = self.proxys.first()
             usernames = [u.strip() for u in p.username.splitlines() if u.strip()]
             for idx, uname in enumerate(usernames):
-                print(f"username: {uname} - password: {p.password} - ip: {p.ip} - port: {p.port_min}")
+                #print(f"username: {uname} - password: {p.password} - ip: {p.ip} - port: {p.port_min}")
                 # Crear sesión para mantener cookies
                 session = requests.Session()
                 session.proxies = {
@@ -78,35 +78,39 @@ class DigiPhone:
                     "disabled_until": None
                 }
         else:
-            #if self.proxys:
-            for p in self.proxys:#range(int(self.proxys.port_min), int(self.proxys.port_max), 1):
-                # Crear sesión para mantener cookies
-                session = requests.Session()
-                session.proxies = {
-                    "http": f"socks5h://{p.username}:{p.password}@{p.ip}:{p.port_min}",
-                    "https": f"socks5h://{p.username}:{p.password}@{p.ip}:{p.port_min}"
-                }
-                proxy_id = f"{p.ip}:{p.port_min}:{p.username}"
-                self.proxies.append({
-                    "proxy": {
-                        "http": f"socks5h://{p.username}:{p.password}@{p.ip}:{p.port_min}",
-                        "https": f"socks5h://{p.username}:{p.password}@{p.ip}:{p.port_min}"
-                    },
-                    "session": session,  # Sesión para mantener cookies
-                    "token": None,  # Mantener por compatibilidad, pero ya no se usa
-                    "preorder": None,
-                    "product": None,
-                    "item": p,
-                    "cart": None,
-                    "proxy_id": proxy_id  # ID único para tracking
-                })
-                # Inicializar health tracking
-                self._proxy_health[proxy_id] = {
-                    "ssl_errors": 0,
-                    "connection_errors": 0,
-                    "last_error_time": None,
-                    "disabled_until": None
-                }
+            # Múltiples registros de proxy - aplicar la misma lógica que arriba
+            for p in self.proxys:
+                # Extraer líneas del campo username (puede tener múltiples configuraciones)
+                usernames = [u.strip() for u in p.username.strip().splitlines() if u.strip()]
+                
+                for uname in usernames:
+                    # Crear sesión para mantener cookies
+                    session = requests.Session()
+                    session.proxies = {
+                        "http": f"socks5h://{uname}:{p.password}@{p.ip}:{p.port_min}",
+                        "https": f"socks5h://{uname}:{p.password}@{p.ip}:{p.port_min}"
+                    }
+                    proxy_id = f"{p.ip}:{p.port_min}:{uname}"
+                    self.proxies.append({
+                        "proxy": {
+                            "http": f"socks5h://{uname}:{p.password}@{p.ip}:{p.port_min}",
+                            "https": f"socks5h://{uname}:{p.password}@{p.ip}:{p.port_min}"
+                        },
+                        "session": session,
+                        "token": None,
+                        "preorder": None,
+                        "product": None,
+                        "item": p,
+                        "cart": None,
+                        "proxy_id": proxy_id
+                    })
+                    # Inicializar health tracking
+                    self._proxy_health[proxy_id] = {
+                        "ssl_errors": 0,
+                        "connection_errors": 0,
+                        "last_error_time": None,
+                        "disabled_until": None
+                    }
 
         self.position = 0
 
@@ -344,7 +348,7 @@ class DigiPhone:
         logging.info(f"[get_phone_number] Cookies disponibles: {list(session.cookies.keys())}")
         
         try:
-            response = session.get(url, headers=headers, timeout=40)
+            response = session.get(url, headers=headers, timeout=15)
             logging.info(f"[get_phone_number] Status: {response.status_code} | Body: {response.text[:200]}...")
             
             # Si la respuesta es exitosa, resetear errores SSL del proxy
@@ -422,7 +426,7 @@ class DigiPhone:
         logging.info(f"[get_phone_by_request] Cookies disponibles: {list(session.cookies.keys())}")
         
         try:
-            response = session.put(url, headers=headers, json=payload, timeout=40)
+            response = session.put(url, headers=headers, json=payload, timeout=15)
             logging.info(f"[get_phone_by_request] Status: {response.status_code} | Body: {response.text[:200]}...")
             if response.text != "":
                 try:
@@ -474,7 +478,7 @@ class DigiPhone:
         
         logging.info(f"[login_with_cookies] Paso 1: Obteniendo cookies de la página principal...")
         try:
-            response_main = session.get(main_url, headers=headers_get, timeout=30)
+            response_main = session.get(main_url, headers=headers_get, timeout=12)
             logging.info(f"[login_with_cookies] Página principal: Status {response_main.status_code}, Cookies: {len(session.cookies)}")
             if session.cookies:
                 logging.info(f"[login_with_cookies] Cookies previas obtenidas: {list(session.cookies.keys())}")
@@ -502,7 +506,7 @@ class DigiPhone:
         logging.info(f"[login_with_cookies] Paso 2: POST a {login_url} para obtener store_access_token...")
         try:
             # POST sin body (Content-Length: 0)
-            response = session.post(login_url, headers=headers_post, timeout=30)
+            response = session.post(login_url, headers=headers_post, timeout=12)
             logging.info(f"[login_with_cookies] Login: Status {response.status_code}, Cookies: {len(session.cookies)}")
             
             # Verificar si se obtuvo la cookie store_access_token
@@ -528,7 +532,7 @@ class DigiPhone:
         proxy = self.proxies[self.position]["proxy"]
         logging.info(f"[login] URL: {url} | proxy: {proxy} (MÉTODO ANTIGUO - NO SE USA)")
         try:
-            response = requests.request("POST", url, headers=headers, data=payload, proxies=proxy, timeout=40)
+            response = requests.request("POST", url, headers=headers, data=payload, proxies=proxy, timeout=15)
             logging.info(f"[login] Status: {response.status_code} | Body: {response.text}")
             return json.loads(response.text)
         except Exception as e:
@@ -578,7 +582,7 @@ class DigiPhone:
             # POST con body vacío (json={} enviará "{}" que es 2 bytes)
             # Si el navegador envía Content-Length: 26, puede ser por un body diferente
             # Por ahora, dejamos que requests calcule Content-Length automáticamente
-            response = session.post(url, headers=headers, json={}, timeout=40)
+            response = session.post(url, headers=headers, json={}, timeout=15)
             logging.info(f"[get_preorder] Status: {response.status_code} | Body: {response.text[:200]}...")
             
             if response.status_code == 201:
@@ -640,7 +644,7 @@ class DigiPhone:
         logging.info(f"[get_config] Cookies disponibles: {list(session.cookies.keys())}")
         
         try:
-            response = session.post(url, headers=headers, json=payload, timeout=40)
+            response = session.post(url, headers=headers, json=payload, timeout=15)
             logging.info(f"[get_config] Status: {response.status_code} | Body: {response.text[:200]}...")
             if response.text:
                 try:
@@ -671,10 +675,10 @@ class DigiPhone:
             logging.info(f"[check_token_and_refresh] Status {data['_info']['status']} detectado, renovando cookies...")
             data_refresh = self.login_with_cookies()
             if data_refresh.get("_info", {}).get("status") == 200:
-                logging.info(f"[check_token_and_refresh] ✓ Cookies renovadas correctamente")
+                logging.info(f"[check_token_and_refresh] Cookies renovadas correctamente")
                 result = True
             else:
-                logging.error(f"[check_token_and_refresh] ✗ Error renovando cookies: {data_refresh.get('_error')}")
+                logging.info(f"[check_token_and_refresh] Error renovando cookies: {data_refresh.get('_error')}")
         return result
 
     def get_access(self, token="", get_cart=True):
@@ -691,14 +695,18 @@ class DigiPhone:
         # Obtener cookies (store_access_token)
         data_login = self.login_with_cookies()
         if data_login.get("_info", {}).get("status") != 200:
-            logging.error(f"[get_access] ✗ Error obteniendo cookies: {data_login.get('_error')}")
+            logging.info(f"[get_access] Error obteniendo cookies: {data_login.get('_error')}")
             return False
-        
-        logging.info("[get_access] ✓ Cookies obtenidas correctamente")
+
+        # MEJORAR: Verificar que las cookies realmente existen
         session = self.proxies[self.position]["session"]
-        if 'store_access_token' in session.cookies:
-            logging.info(f"[get_access] store_access_token: {session.cookies.get('store_access_token')[:50]}...")
-        
+        if 'store_access_token' not in session.cookies:
+            logging.info("[get_access] store_access_token NO encontrado en cookies después de login exitoso")
+            return False
+
+        logging.info("[get_access] ✓ Cookies obtenidas correctamente")
+        logging.info(f"[get_access] store_access_token: {session.cookies.get('store_access_token')[:50]}...")
+
         # Obtener preorder solo si get_cart es True (para validate_phone_number se necesita preorder)
         # Para get_phone_number no se necesita preorder ni cart, solo cookies
         if get_cart:

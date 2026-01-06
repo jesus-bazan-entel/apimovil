@@ -109,31 +109,37 @@ SECURE_PROXY_SSL_HEADER = None
 
 STATICFILES_STORAGE = "django.contrib.staticfiles.storage.ManifestStaticFilesStorage"
 
+# ============================================================================
+# CELERY CONFIGURATION
+# ============================================================================
+CELERY_BROKER_URL = 'redis://127.0.0.1:6379/0'
+CELERY_RESULT_BACKEND = 'redis://127.0.0.1:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
-#CELERY_WORKER_PREFETCH_MULTIPLIER = 1
-#CELERY_TASK_ACKS_LATE = True
-#CELERY_TASK_SOFT_TIME_LIMIT = 45
-#CELERY_TASK_TIME_LIMIT = 60
-#CELERY_BROKER_POOL_LIMIT = 10
-#CELERY_BROKER_CONNECTION_TIMEOUT = 30
-#CELERY_TASK_ANNOTATIONS = {'*': {'max_retries': 3, 'rate_limit': '10/m'}}
+CELERY_TIMEZONE = 'America/Lima'  # Ajusta según tu zona horaria
+CELERY_TASK_TRACK_STARTED = True
+CELERY_TASK_TIME_LIMIT = 30 * 60  # 30 minutos
 
-# Configuración de Celery Beat
-CELERY_BEAT_SCHEDULE = {
-    'process_incomplete_files_every_30_minutes': {
-        'task': 'app.tasks.process_incomplete_files_task',
-        'schedule': crontab(minute='*/5'),  # Ejecutar cada 30 minutos
-    },
+CACHES = {
+    'default': {
+        'BACKEND': 'django_redis.cache.RedisCache',
+        'LOCATION': 'redis://127.0.0.1:6379/1',  # Base de datos 1 (Celery usa la 0)
+        'OPTIONS': {
+            'CLIENT_CLASS': 'django_redis.client.DefaultClient',
+            # 'PARSER_CLASS': 'redis.connection.HiredisParser',  # Comentado - no necesario
+            'CONNECTION_POOL_KWARGS': {'max_connections': 50},
+            'PICKLE_VERSION': -1,
+        },
+        'KEY_PREFIX': 'apimovil',
+        'TIMEOUT': None,  # Sin expiración por defecto
+    }
 }
 
-# Configuración de Celery
-CELERY_BROKER_URL = 'redis://localhost:6379/0'  # Usando Redis como broker
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'  # Redis también como backend de resultados
-
-
+# Configuración adicional de cache
+CACHE_MIDDLEWARE_ALIAS = 'default'
+CACHE_MIDDLEWARE_SECONDS = 600
+CACHE_MIDDLEWARE_KEY_PREFIX = 'apimovil'
 
 # Database
 # https://docs.djangoproject.com/en/3.2/ref/settings/#databases
@@ -151,10 +157,7 @@ DATABASES = {
         'CONN_MAX_AGE': 0,
         'OPTIONS': {
             'connect_timeout': 10,
-            'keepalives': 1,
-            'keepalives_idle': 30,
-            'keepalives_interval': 10,
-            'keepalives_count': 5,
+            'options': '-c statement_timeout=30000'
         },
     }
 }
