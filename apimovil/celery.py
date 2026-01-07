@@ -5,6 +5,10 @@ SISTEMA DE COLAS POR USUARIO:
 - Cada usuario tiene su propia cola: user_queue_<user_id>
 - Los workers procesan todas las colas en round-robin
 - Esto garantiza que archivos de diferentes usuarios se procesen en paralelo
+
+COLA DE MANTENIMIENTO:
+- Cola 'maintenance' para tareas periódicas críticas (check_orphan, sync_progress)
+- Se procesa con alta prioridad para evitar que archivos queden sin procesar
 """
 import os
 from celery import Celery
@@ -60,31 +64,36 @@ app.conf.update(
     # Conexiones DB
     worker_pool_restarts=True,
     
-    # COLAS: Cola por defecto + colas de usuario
-    task_queues=[Queue('celery')] + USER_QUEUES,
+    # COLAS: maintenance (alta prioridad) + celery + colas de usuario
+    task_queues=[
+        Queue('maintenance'),  # Cola de alta prioridad para tareas de mantenimiento
+        Queue('celery'),
+    ] + USER_QUEUES,
     
     # Cola por defecto para tareas que no especifican cola
     task_default_queue='celery',
     
-    # Rutas de tareas (las tareas de scraping van a colas de usuario)
+    # Rutas de tareas
     task_routes={
-        'app.tasks.scrape_and_save_phone_task': {
-            'queue': 'celery',  # Se sobreescribe dinámicamente
-        },
-        'app.tasks.process_file_in_batches': {
-            'queue': 'celery',  # Se sobreescribe dinámicamente
-        },
+        # Tareas de mantenimiento van a cola dedicada
+        'app.tasks.check_and_requeue_orphan_files': {'queue': 'maintenance'},
+        'app.tasks.sync_progress_with_movil': {'queue': 'maintenance'},
+        # Tareas de scraping se sobreescriben dinámicamente
+        'app.tasks.scrape_and_save_phone_task': {'queue': 'celery'},
+        'app.tasks.process_file_in_batches': {'queue': 'celery'},
     },
     
     # Celery Beat - Tareas periódicas
     beat_schedule={
         'sync-progress-every-30-seconds': {
             'task': 'app.tasks.sync_progress_with_movil',
-            'schedule': 30.0,  # Cada 30 segundos
+            'schedule': 30.0,
+            'options': {'queue': 'maintenance'},
         },
-        'check-orphan-files-every-60-seconds': {
+        'check-orphan-files-every-30-seconds': {
             'task': 'app.tasks.check_and_requeue_orphan_files',
-            'schedule': 60.0,  # Cada 60 segundos
+            'schedule': 30.0,
+            'options': {'queue': 'maintenance'},
         },
     },
 )

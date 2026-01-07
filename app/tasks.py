@@ -191,8 +191,14 @@ def sync_progress_with_movil():
 @shared_task
 def check_and_requeue_orphan_files():
     """
-    Detecta archivos activos que no tienen tareas en cola y los re-encola.
+    Detecta archivos que no tienen tareas en cola y los re-encola.
     Esto previene que archivos queden "huérfanos" sin procesar.
+    
+    CASOS QUE DETECTA:
+    1. Archivos NUEVOS (progreso=0) que nunca empezaron - re-encola inmediatamente
+    2. Archivos EN PROGRESO que se quedaron sin tareas en cola
+    3. Archivos donde el progreso no avanza pero hay registros en Movil
+    4. Archivos PAUSADOS que tienen tareas pendientes (se reactivan)
     """
     import redis
     from django.utils import timezone
@@ -200,47 +206,85 @@ def check_and_requeue_orphan_files():
     
     r = redis.Redis(host='127.0.0.1', port=6379, db=0)
     requeued = []
+    reactivated = []
+    skipped = []
     
-    # Buscar archivos activos que no han avanzado en los últimos 2 minutos
-    stale_threshold = timezone.now() - timedelta(minutes=2)
-    
-    for c in Consecutive.objects.filter(active=True, progres__lt=F('total')):
-        # Verificar si hay tareas en la cola del usuario
+    # Buscar TODOS los archivos incompletos (activos Y pausados)
+    for c in Consecutive.objects.filter(progres__lt=F('total')):
         user_queue = f'user_queue_{c.user.id}'
         queue_count = r.llen(user_queue)
-        
-        # Contar registros actuales
         current_count = Movil.objects.filter(file=c.file).count()
         
-        # Si el progreso no ha cambiado y no hay tareas en cola, re-encolar
-        if queue_count == 0 and current_count < c.total:
-            # Verificar que realmente no haya tareas pendientes
-            celery_queue_count = r.llen('celery')
+        should_requeue = False
+        reason = ""
+        
+        # CASO 1: Archivo NUEVO que nunca empezó (progreso=0, sin tareas en cola)
+        if c.progres == 0 and current_count == 0 and queue_count == 0 and c.active:
+            should_requeue = True
+            reason = "archivo nuevo sin iniciar"
+        
+        # CASO 2: Archivo ACTIVO con progreso pero sin tareas en cola y sin avance
+        elif c.active and queue_count == 0 and current_count < c.total:
+            if current_count == c.progres or current_count <= c.progres:
+                should_requeue = True
+                reason = "archivo estancado sin tareas"
+        
+        # CASO 3: Hay discrepancia entre progreso y Movil count
+        elif queue_count == 0 and current_count > c.progres:
+            c.progres = current_count
+            c.save()
+            logger.info(f"[check_orphan] 📊 Sincronizado progreso: {c.file} → {c.progres}/{c.total}")
             
-            # Solo re-encolar si el archivo está realmente estancado
-            if current_count == c.progres or c.progres == 0:
-                logger.warning(f"[check_orphan] ⚠ Archivo huérfano detectado: {c.file} (ID: {c.id})")
-                logger.info(f"[check_orphan]   Usuario: {c.user.id}, Progreso: {c.progres}/{c.total}, Cola: {queue_count}")
-                
-                # Re-encolar el proceso
-                process_file_in_batches.apply_async(
-                    kwargs={
-                        'consecutive_id': c.id,
-                        'batch_size': 100
-                    },
-                    queue=user_queue
-                )
-                
-                requeued.append(f"{c.file} (ID: {c.id})")
-                logger.info(f"[check_orphan] ✅ Re-encolado: {c.file}")
+            if current_count < c.total and c.active:
+                should_requeue = True
+                reason = "archivo desincronizado, continuando"
+        
+        # CASO 4: Archivo PAUSADO pero con tareas en cola (se reactivó externamente)
+        # O archivo pausado que debería continuar procesando
+        if not c.active and queue_count > 0:
+            # Hay tareas en cola pero el archivo está pausado → Reactivar
+            c.active = True
+            c.save()
+            reactivated.append(f"{c.file} (ID: {c.id}) - tenía {queue_count} tareas en cola")
+            logger.info(f"[check_orphan] 🔄 Reactivado: {c.file} (tenía {queue_count} tareas pendientes)")
+        
+        if should_requeue:
+            logger.warning(f"[check_orphan] ⚠ Archivo huérfano: {c.file} (ID: {c.id}) - {reason}")
+            logger.info(f"[check_orphan]   Usuario: {c.user.id}, Progreso: {c.progres}/{c.total}, Movil: {current_count}, Cola: {queue_count}")
+            
+            # Asegurar que el archivo esté activo antes de re-encolar
+            if not c.active:
+                c.active = True
+                c.save()
+                logger.info(f"[check_orphan] 🔄 Reactivado estado: {c.file}")
+            
+            process_file_in_batches.apply_async(
+                kwargs={
+                    'consecutive_id': c.id,
+                    'batch_size': 100
+                },
+                queue=user_queue
+            )
+            
+            requeued.append(f"{c.file} (ID: {c.id}) - {reason}")
+            logger.info(f"[check_orphan] ✅ Re-encolado: {c.file}")
+        else:
+            if queue_count > 0 and c.active:
+                skipped.append(f"{c.file}: {queue_count} tareas en cola")
     
     if requeued:
         logger.info(f"[check_orphan] 🔄 Re-encolados {len(requeued)} archivos huérfanos")
     
+    if reactivated:
+        logger.info(f"[check_orphan] ✅ Reactivados {len(reactivated)} archivos")
+    
     return {
         "status": "success",
         "requeued_count": len(requeued),
-        "requeued_files": requeued
+        "requeued_files": requeued,
+        "reactivated_count": len(reactivated),
+        "reactivated_files": reactivated,
+        "skipped_count": len(skipped)
     }
 
 
